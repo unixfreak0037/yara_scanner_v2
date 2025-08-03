@@ -56,7 +56,7 @@ from operator import itemgetter
 import hashlib
 import tempfile
 from subprocess import PIPE, Popen
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import plyara, plyara.utils
 import progress.bar
@@ -357,6 +357,7 @@ class YaraScanner(object):
             if self.tracked_files[file_path] is None and os.path.exists(file_path):
                 log.info(f"detected recreated yara file {file_path}")
                 self.track_yara_file(file_path)
+                reload_rules = True
             # was the file deleted?
             elif self.tracked_files[file_path] is not None and not os.path.exists(file_path):
                 log.info(f"detected deleted yara file {file_path}")
@@ -423,7 +424,10 @@ class YaraScanner(object):
         all_files = {}  # key = "namespace", value = [] of file_paths
 
         # XXX there's a bug in yara where using an empty string as the namespace causes a segfault
-        all_files["DEFAULT"] = [_ for _ in self.tracked_files.keys() if self.tracked_files[_] is not None]
+        #all_files["DEFAULT"] = [_ for _ in self.tracked_files.keys() if self.tracked_files[_] is not None]
+        for tracked_file_path in self.tracked_files.keys():
+            all_files[tracked_file_path] = [tracked_file_path]
+
         for dir_path in self.tracked_dirs.keys():
             all_files[dir_path] = self.tracked_dirs[dir_path]
 
@@ -753,6 +757,34 @@ class YaraScanner(object):
 
         :rtype: bool"""
 
+        # as we interate over the files to make sure they compile, we need to
+        # keep track of the current file path
+        current_file_path = None
+
+        def include_callback(requested_filename: str, filename: Optional[str], namespace: str) -> str:
+            nonlocal current_file_path
+
+            # if namespace is not "default" then its set to the directory of the current file
+            if namespace != "default":
+                dir_name = namespace
+            else:
+                # otherwise we use the directory of the current file
+                if filename is not None:
+                    dir_name = os.path.dirname(filename)
+                else:
+                    # otherwise we use the non local variable that gets set outside of this function
+                    dir_name = os.path.dirname(current_file_path)
+
+            # build the path to the requested file that is relative to dir_name
+            relative_path = os.path.join(dir_name, requested_filename)
+
+            try:
+                with open(relative_path, "r") as fp:
+                    return fp.read()
+            except Exception as e:
+                log.error("unable to include file %s: %s", relative_path, e)
+                return ""
+
         if self.tracked_compiled_path:
             try:
                 self.tracked_compiled_lastmtime = os.path.getmtime(self.tracked_compiled_path)
@@ -782,13 +814,21 @@ class YaraScanner(object):
 
         for namespace in all_files.keys():
             for file_path in all_files[namespace]:
+
+                if not os.path.exists(file_path):
+                    log.debug("file %s does not exist", file_path)
+                    continue
+
+                # this tells the callback function where to look for files
+                current_file_path = file_path
+
                 with open(file_path, "r") as fp:
                     log.debug("loading namespace {} rule file {}".format(namespace, file_path))
                     data = fp.read()
 
                     try:
-                        # compile the file as a whole first, make sure that works
-                        rule_context = yara.compile(source=data, externals=external_vars)
+                        # compile each file individually first, make sure that works
+                        rule_context = yara.compile(source=data, externals=external_vars, include_callback=include_callback)
                         rule_count += 1
                     except Exception as e:
                         log.error("unable to compile {}: {}".format(file_path, str(e)))
@@ -803,9 +843,11 @@ class YaraScanner(object):
         for namespace in sources.keys():
             sources[namespace] = "\r\n".join(sources[namespace])
 
+        current_file_path = None
+
         try:
             log.info("loading {} rules".format(rule_count))
-            self.rules = yara.compile(sources=sources, externals=external_vars)
+            self.rules = yara.compile(sources=sources, externals=external_vars, include_callback=include_callback)
             return True
         except Exception as e:
             log.error(f"unable to compile all yara rules combined: {e}")

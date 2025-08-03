@@ -180,33 +180,33 @@ def test_auto_compile(shared_datadir, tmpdir, caplog):
 
 @pytest.mark.integration
 def test_single_file_tracking(scanner, shared_datadir):
-    s = YaraScanner()
+    scanner = YaraScanner()
     yara_rule_path = str(shared_datadir / 'signatures' / 'ruleset_a' / 'rule_1.yar')
-    s.track_yara_file(yara_rule_path)
-    s.load_rules()
-    assert not s.check_rules()
-    assert s.tracked_files
-    assert yara_rule_path in s.tracked_files
+    scanner.track_yara_file(yara_rule_path)
+    scanner.load_rules()
+    assert not scanner.check_rules()
+    assert scanner.tracked_files
+    assert yara_rule_path in scanner.tracked_files
     with open(yara_rule_path, 'a') as fp:
         fp.write('\n//test')
 
     # this should return True after the file has been modified
-    assert s.check_rules()
-    s.load_rules()
-    assert not s.check_rules()
+    assert scanner.check_rules()
+    scanner.load_rules()
+    assert not scanner.check_rules()
     with open(yara_rule_path, 'r') as fp:
         rule_content = fp.read()
 
     os.remove(yara_rule_path)
-    assert s.check_rules()
-    assert s.tracked_files[yara_rule_path] is None
-    assert not s.load_rules()
+    assert scanner.check_rules()
+    assert scanner.tracked_files[yara_rule_path] is None
+    assert scanner.load_rules()
 
     with open(yara_rule_path, 'w') as fp:
         fp.write(rule_content)
 
-    assert s.check_rules()
-    assert s.load_rules()
+    assert scanner.check_rules()
+    assert scanner.load_rules()
 
 @pytest.mark.integration
 def test_dir_tracking(shared_datadir):
