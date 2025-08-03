@@ -1,0 +1,5 @@
+pytest
+pylint
+pytest-datadir
+sphinx
+pygments

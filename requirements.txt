@@ -1,0 +1,4 @@
+psutil
+yara-python
+plyara
+progress
