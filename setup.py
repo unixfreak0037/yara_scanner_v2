@@ -10,7 +10,7 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 
 setup(
     name="yara_scanner_v2",
-    version="2.0.0",
+    version="2.0.1",
     author="John Davison",
     author_email="unixfreak0037@gmail.com",
     description="A Python wrapper library for libyara and a local server for fully utilizing the CPUs of the system to scan with yara.",
