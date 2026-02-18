@@ -14,6 +14,8 @@ def main():
         help="Read the list of files to scan from stdin.")
     parser.add_argument('-j', '--dump-json', required=False, default=False, action='store_true', dest='dump_json',
         help="Dump JSON details of matches.  Otherwise just list the rules that hit.")
+    parser.add_argument('--meta-tags', nargs='+', dest='meta_tags', default=None,
+        help="One or more tags describing the scan target for context-based rule filtering.")
     parser.add_argument('files', nargs="*", help="The file to scan.")
     args = parser.parse_args()
 
@@ -23,7 +25,7 @@ def main():
             args.files.append(line)
 
     for _file in args.files:
-        scan_results = scan_file(_file, base_dir=args.base_dir)
+        scan_results = scan_file(_file, base_dir=args.base_dir, meta_tags=args.meta_tags)
         if not scan_results:
             print("{}: no matches".format(_file))
         else:

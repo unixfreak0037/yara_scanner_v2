@@ -567,3 +567,329 @@ def test_meta_directives(tmp_path, yara_rule_content, scan_target_name, scan_tar
     else:
         assert not scanner.scan(scan_target_path)
         assert len(scanner.scan_results) == 0
+
+#region meta_tags_tests
+meta_tags_tests = [
+    # (rule, filename, content, caller_meta_tags, expected)
+
+    # exact match - match
+    ("""
+rule test_meta_tags_exact {
+meta:
+    meta_tags = "email_attachment"
+strings:
+    $ = "Sample content."
+condition:
+    all of them
+}
+    """,
+    'target.txt',
+    'Sample content.',
+    ["email_attachment"],
+    True),
+
+    # exact match - no match
+    ("""
+rule test_meta_tags_exact_nomatch {
+meta:
+    meta_tags = "email_attachment"
+strings:
+    $ = "Sample content."
+condition:
+    all of them
+}
+    """,
+    'target.txt',
+    'Sample content.',
+    ["web_download"],
+    False),
+
+    # no tags provided (None) - non-inverted rule should skip
+    ("""
+rule test_meta_tags_none {
+meta:
+    meta_tags = "email_attachment"
+strings:
+    $ = "Sample content."
+condition:
+    all of them
+}
+    """,
+    'target.txt',
+    'Sample content.',
+    None,
+    False),
+
+    # no tags provided (empty list) - non-inverted rule should skip
+    ("""
+rule test_meta_tags_empty {
+meta:
+    meta_tags = "email_attachment"
+strings:
+    $ = "Sample content."
+condition:
+    all of them
+}
+    """,
+    'target.txt',
+    'Sample content.',
+    [],
+    False),
+
+    # comma-separated OR - one matches
+    ("""
+rule test_meta_tags_csv {
+meta:
+    meta_tags = "email_attachment,web_download"
+strings:
+    $ = "Sample content."
+condition:
+    all of them
+}
+    """,
+    'target.txt',
+    'Sample content.',
+    ["web_download"],
+    True),
+
+    # negation - tag present -> skip
+    ("""
+rule test_meta_tags_negated {
+meta:
+    meta_tags = "!trusted"
+strings:
+    $ = "Sample content."
+condition:
+    all of them
+}
+    """,
+    'target.txt',
+    'Sample content.',
+    ["trusted"],
+    False),
+
+    # negation - tag NOT present -> don't skip
+    ("""
+rule test_meta_tags_negated_nomatch {
+meta:
+    meta_tags = "!trusted"
+strings:
+    $ = "Sample content."
+condition:
+    all of them
+}
+    """,
+    'target.txt',
+    'Sample content.',
+    ["suspicious"],
+    True),
+
+    # negation with no tags provided -> should match (NOT X with no tags = don't skip)
+    ("""
+rule test_meta_tags_negated_none {
+meta:
+    meta_tags = "!trusted"
+strings:
+    $ = "Sample content."
+condition:
+    all of them
+}
+    """,
+    'target.txt',
+    'Sample content.',
+    None,
+    True),
+
+    # regex match
+    ("""
+rule test_meta_tags_regex {
+meta:
+    meta_tags = "re:^email_"
+strings:
+    $ = "Sample content."
+condition:
+    all of them
+}
+    """,
+    'target.txt',
+    'Sample content.',
+    ["email_attachment"],
+    True),
+
+    # regex no match
+    ("""
+rule test_meta_tags_regex_nomatch {
+meta:
+    meta_tags = "re:^email_"
+strings:
+    $ = "Sample content."
+condition:
+    all of them
+}
+    """,
+    'target.txt',
+    'Sample content.',
+    ["web_download"],
+    False),
+
+    # substring match
+    ("""
+rule test_meta_tags_sub {
+meta:
+    meta_tags = "sub:attach"
+strings:
+    $ = "Sample content."
+condition:
+    all of them
+}
+    """,
+    'target.txt',
+    'Sample content.',
+    ["email_attachment"],
+    True),
+
+    # negated regex
+    ("""
+rule test_meta_tags_negated_regex {
+meta:
+    meta_tags = "!re:^trusted"
+strings:
+    $ = "Sample content."
+condition:
+    all of them
+}
+    """,
+    'target.txt',
+    'Sample content.',
+    ["trusted_source"],
+    False),
+
+    # negated regex - no match on regex -> rule applies
+    ("""
+rule test_meta_tags_negated_regex_pass {
+meta:
+    meta_tags = "!re:^trusted"
+strings:
+    $ = "Sample content."
+condition:
+    all of them
+}
+    """,
+    'target.txt',
+    'Sample content.',
+    ["suspicious"],
+    True),
+
+    # multiple caller tags - one matches
+    ("""
+rule test_meta_tags_multi_caller {
+meta:
+    meta_tags = "email_attachment"
+strings:
+    $ = "Sample content."
+condition:
+    all of them
+}
+    """,
+    'target.txt',
+    'Sample content.',
+    ["web_download", "email_attachment"],
+    True),
+
+    # case insensitivity
+    ("""
+rule test_meta_tags_case {
+meta:
+    meta_tags = "Email_Attachment"
+strings:
+    $ = "Sample content."
+condition:
+    all of them
+}
+    """,
+    'target.txt',
+    'Sample content.',
+    ["email_attachment"],
+    True),
+
+    # combined with file_ext - both match
+    ("""
+rule test_meta_tags_combined {
+meta:
+    meta_tags = "email_attachment"
+    file_ext = "txt"
+strings:
+    $ = "Sample content."
+condition:
+    all of them
+}
+    """,
+    'target.txt',
+    'Sample content.',
+    ["email_attachment"],
+    True),
+
+    # combined with file_ext - meta_tags matches but file_ext doesn't
+    ("""
+rule test_meta_tags_combined_fail {
+meta:
+    meta_tags = "email_attachment"
+    file_ext = "pdf"
+strings:
+    $ = "Sample content."
+condition:
+    all of them
+}
+    """,
+    'target.txt',
+    'Sample content.',
+    ["email_attachment"],
+    False),
+]
+#endregion
+
+@pytest.mark.integration
+@pytest.mark.parametrize("yara_rule_content, scan_target_name, scan_target_content, caller_meta_tags, expected", meta_tags_tests)
+def test_meta_tags_directive(tmp_path, yara_rule_content, scan_target_name, scan_target_content, caller_meta_tags, expected):
+    scanner = YaraScanner()
+    yara_rule_path = create_file(str(tmp_path / 'rule.yar'), yara_rule_content)
+    scan_target_path = create_file(str(tmp_path / scan_target_name), scan_target_content)
+    scanner.track_yara_file(yara_rule_path)
+    scanner.load_rules()
+
+    if expected:
+        assert scanner.scan(scan_target_path, meta_tags=caller_meta_tags)
+        assert len(scanner.scan_results) == 1
+    else:
+        assert not scanner.scan(scan_target_path, meta_tags=caller_meta_tags)
+        assert len(scanner.scan_results) == 0
+
+@pytest.mark.integration
+def test_meta_tags_scan_data(tmp_path):
+    """Test that meta_tags works with scan_data() as well."""
+    rule_content = """
+rule test_meta_tags_data {
+meta:
+    meta_tags = "email_attachment"
+strings:
+    $ = "Sample content."
+condition:
+    all of them
+}
+    """
+    scanner = YaraScanner()
+    yara_rule_path = create_file(str(tmp_path / 'rule.yar'), rule_content)
+    scanner.track_yara_file(yara_rule_path)
+    scanner.load_rules()
+
+    # with matching tag
+    assert scanner.scan_data('Sample content.', meta_tags=["email_attachment"])
+    assert len(scanner.scan_results) == 1
+
+    # without matching tag
+    assert not scanner.scan_data('Sample content.', meta_tags=["web_download"])
+    assert len(scanner.scan_results) == 0
+
+    # with no tags
+    assert not scanner.scan_data('Sample content.', meta_tags=None)
+    assert len(scanner.scan_results) == 0

@@ -2,6 +2,8 @@
 
 from setuptools import setup, find_packages
 
+from yara_scanner import __version__
+
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
@@ -10,7 +12,7 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 
 setup(
     name="yara_scanner_v2",
-    version="2.0.1",
+    version=__version__,
     author="John Davison",
     author_email="unixfreak0037@gmail.com",
     description="A Python wrapper library for libyara and a local server for fully utilizing the CPUs of the system to scan with yara.",

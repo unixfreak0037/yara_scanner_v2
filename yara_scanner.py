@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # vim: sw=4:ts=4:et:cc=120
-__version__ = "2.0.0"
+__version__ = "3.0.0"
 __doc__ = """
 Yara Scanner v2
 ============
@@ -856,7 +856,7 @@ class YaraScanner(object):
         return False
 
     # we're keeping things backwards compatible here...
-    def scan(self, file_path, yara_stdout_file=None, yara_stderr_file=None, external_vars={}, timeout=None):
+    def scan(self, file_path, yara_stdout_file=None, yara_stderr_file=None, external_vars={}, timeout=None, meta_tags=None):
         """
         Scans the given file with the loaded yara rules. Returns True if at least one yara rule matches, False otherwise.
 
@@ -870,6 +870,13 @@ class YaraScanner(object):
         :type external_vars: dict
         :rtype: bool
         """
+
+        # defensive copy to avoid mutating caller's dict
+        external_vars = dict(external_vars)
+        # extract piggybacked meta_tags from ext_vars (used by client-server protocol)
+        _piggybacked = external_vars.pop("__meta_tags", None)
+        if _piggybacked and not meta_tags:
+            meta_tags = _piggybacked
 
         # default external variables
         default_external_vars = {
@@ -897,10 +904,11 @@ class YaraScanner(object):
             yara_matches = self.rules.match(file_path, externals=default_external_vars, timeout=timeout)
 
         return self.filter_scan_results(
-            file_path, None, yara_matches, yara_stdout_file, yara_stderr_file, external_vars
+            file_path, None, yara_matches, yara_stdout_file, yara_stderr_file, external_vars,
+            meta_tags=meta_tags,
         )
 
-    def scan_data(self, data, yara_stdout_file=None, yara_stderr_file=None, external_vars={}, timeout=None):
+    def scan_data(self, data, yara_stdout_file=None, yara_stderr_file=None, external_vars={}, timeout=None, meta_tags=None):
         """
         Scans the given data with the loaded yara rules. ``data`` can be either a str or bytes object. Returns True if at least one yara rule matches, False otherwise.
 
@@ -917,16 +925,25 @@ class YaraScanner(object):
 
         assert self.rules is not None
 
+        # defensive copy to avoid mutating caller's dict
+        external_vars = dict(external_vars)
+        # extract piggybacked meta_tags from ext_vars (used by client-server protocol)
+        _piggybacked = external_vars.pop("__meta_tags", None)
+        if _piggybacked and not meta_tags:
+            meta_tags = _piggybacked
+
         if not timeout:
             timeout = self.default_timeout
 
         # scan the data stream
         # external variables come from the profile points added to the file
         yara_matches = self.rules.match(data=data, externals=external_vars, timeout=timeout)
-        return self.filter_scan_results(None, data, yara_matches, yara_stdout_file, yara_stderr_file, external_vars)
+        return self.filter_scan_results(None, data, yara_matches, yara_stdout_file, yara_stderr_file, external_vars,
+                                        meta_tags=meta_tags)
 
     def filter_scan_results(
-        self, file_path, data, yara_matches, yara_stdout_file=None, yara_stderr_file=None, external_vars={}
+        self, file_path, data, yara_matches, yara_stdout_file=None, yara_stderr_file=None, external_vars={},
+        meta_tags=None,
     ):
 
         # if we didn't specify a file_path then we default to an empty string
@@ -999,6 +1016,45 @@ class YaraScanner(object):
 
                 elif directive.lower() == "full_path":
                     compare_target = file_path
+
+                elif directive.lower() == "meta_tags":
+                    # meta_tags is special: we compare each rule-specified tag against each caller-provided tag
+                    caller_tags = meta_tags or []
+
+                    if not caller_tags:
+                        # no tags provided by caller
+                        if not inverted:
+                            # non-inverted: rule wants specific tags but none provided -> skip
+                            skip = True
+                            break
+                        else:
+                            # inverted: rule says "NOT these tags" and none provided -> don't skip
+                            continue
+
+                    # build compare function
+                    if use_regex:
+                        compare_function = lambda user_supplied, target: re.search(user_supplied, target, re.IGNORECASE)
+                    elif use_substring:
+                        compare_function = lambda user_supplied, target: user_supplied.lower() in target.lower()
+                    else:
+                        compare_function = lambda user_supplied, target: user_supplied.lower() == target.lower()
+
+                    # cross-product: any rule value matches any caller tag
+                    matches = False
+                    for search_item in [x.strip() for x in value.lower().split(",")]:
+                        for caller_tag in caller_tags:
+                            matches = matches or compare_function(search_item, caller_tag)
+
+                    if (inverted and matches) or (not inverted and not matches):
+                        log.debug(
+                            "skipping yara rule {} directive {} list {} negated {} regex {} subsearch {}".format(
+                                match_result.rule, directive, value, inverted, use_regex, use_substring
+                            )
+                        )
+                        skip = True
+                        break
+
+                    continue
 
                 else:
                     # not a meta tag we're using
@@ -1363,14 +1419,17 @@ class YaraScannerServer(object):
             # parse the ext vars json
             ext_vars = json.loads(ext_vars.decode())
 
+        # extract piggybacked meta_tags from ext_vars
+        meta_tags = ext_vars.pop("__meta_tags", None)
+
         try:
             matches = False
             if command == COMMAND_FILE_PATH:
                 log.info("scanning file {}".format(data_or_file))
-                matches = self.scanner.scan(data_or_file, external_vars=ext_vars)
+                matches = self.scanner.scan(data_or_file, external_vars=ext_vars, meta_tags=meta_tags)
             elif command == COMMAND_DATA_STREAM:
                 log.info("scanning {} byte data stream".format(len(data_or_file)))
-                matches = self.scanner.scan_data(data_or_file, external_vars=ext_vars)
+                matches = self.scanner.scan_data(data_or_file, external_vars=ext_vars, meta_tags=meta_tags)
             else:
                 log.error("invalid command {}".format(command))
                 return
@@ -1429,13 +1488,18 @@ class YaraScannerServer(object):
             log.error("unable to stop rule monitor thread")
 
 
-def _scan(command, data_or_file, ext_vars={}, base_dir=DEFAULT_BASE_DIR, socket_dir=DEFAULT_SOCKET_DIR):
+def _scan(command, data_or_file, ext_vars={}, base_dir=DEFAULT_BASE_DIR, socket_dir=DEFAULT_SOCKET_DIR, meta_tags=None):
     # pick a random scanner
     # it doesn't matter which one, as long as the load is evenly distributed
     starting_index = scanner_index = random.randrange(multiprocessing.cpu_count())
 
     while True:
         socket_path = os.path.join(base_dir, socket_dir, str(scanner_index))
+
+        # piggyback meta_tags into ext_vars for the wire protocol
+        if meta_tags:
+            ext_vars = dict(ext_vars)
+            ext_vars["__meta_tags"] = meta_tags
 
         ext_vars_json = b""
         if ext_vars:
@@ -1477,12 +1541,12 @@ def _scan(command, data_or_file, ext_vars={}, base_dir=DEFAULT_BASE_DIR, socket_
             continue
 
 
-def scan_file(path, base_dir=None, socket_dir=DEFAULT_SOCKET_DIR, ext_vars={}):
-    return _scan(COMMAND_FILE_PATH, path, ext_vars=ext_vars, base_dir=base_dir, socket_dir=socket_dir)
+def scan_file(path, base_dir=None, socket_dir=DEFAULT_SOCKET_DIR, ext_vars={}, meta_tags=None):
+    return _scan(COMMAND_FILE_PATH, path, ext_vars=ext_vars, base_dir=base_dir, socket_dir=socket_dir, meta_tags=meta_tags)
 
 
-def scan_data(data):  # XXX ????
-    return _scan(COMMAND_DATA_STREAM, data, ext_vars=ext_vars, base_dir=base_dir, socket_dir=socket_dir)
+def scan_data(data, base_dir=None, socket_dir=DEFAULT_SOCKET_DIR, ext_vars={}, meta_tags=None):
+    return _scan(COMMAND_DATA_STREAM, data, ext_vars=ext_vars, base_dir=base_dir, socket_dir=socket_dir, meta_tags=meta_tags)
 
 
 #

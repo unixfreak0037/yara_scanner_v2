@@ -190,6 +190,7 @@ file_ext   | Matches everything past the first period in the file name.
 file_name  | Matches the full name of the file (not including the path.)
 full_path  | Matches against the full path of the file, if one was specified.
 mime_type  | Matches against the output of file -b --mime-type.
+meta_tags  | Matches against tags passed by the caller at scan time for context-based filtering.
 ```
 
 The value of the metadata variable is a **comma separated list** of values to match. By default the library matches as is, but special modifiers can be used to perform sub string matching and regular expressions. **Special modifiers are applied to all comma separated values in the string.**
@@ -252,6 +253,39 @@ Only match files in a subdirectory called /ole.
 
 ```
 full_path = "sub:/ole/"
+```
+
+Only match when the caller provides the "email_attachment" tag.
+
+```
+meta_tags = "email_attachment"
+```
+
+Only match when the caller provides either the "suspicious" or "quarantined" tag.
+
+```
+meta_tags = "suspicious,quarantined"
+```
+
+Only match when the caller does NOT provide the "trusted" tag.
+
+```
+meta_tags = "!trusted"
+```
+
+### Passing meta_tags
+
+Via the Python API:
+
+```python
+scanner.scan('/path/to/file', meta_tags=["email_attachment", "suspicious"])
+scanner.scan_data(data, meta_tags=["email_attachment"])
+```
+
+Via the client CLI:
+
+```bash
+ysc --meta-tags email_attachment suspicious /path/to/file
 ```
 
 ## Yara Rule Performance Testing
