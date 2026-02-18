@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # vim: sw=4:ts=4:et:cc=120
-__version__ = "3.0.0"
+__version__ = "2.1.0"
 __doc__ = """
 Yara Scanner v2
 ============
