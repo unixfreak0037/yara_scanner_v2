@@ -812,6 +812,8 @@ class YaraScanner(object):
             self.rules = None
             return False
 
+        compilation_errors = False
+
         for namespace in all_files.keys():
             for file_path in all_files[namespace]:
 
@@ -832,6 +834,7 @@ class YaraScanner(object):
                         rule_count += 1
                     except Exception as e:
                         log.error("unable to compile {}: {}".format(file_path, str(e)))
+                        compilation_errors = True
                         continue
 
                     # then we just store the source to be loaded all at once in the compilation that gets used
@@ -848,7 +851,7 @@ class YaraScanner(object):
         try:
             log.info("loading {} rules".format(rule_count))
             self.rules = yara.compile(sources=sources, externals=external_vars, include_callback=include_callback)
-            return True
+            return not compilation_errors
         except Exception as e:
             log.error(f"unable to compile all yara rules combined: {e}")
             self.rules = None
@@ -1869,7 +1872,8 @@ def main():
         for repo_path in args.yara_repos:
             scanner.track_yara_repository(repo_path)
 
-    scanner.load_rules()
+    if not scanner.load_rules():
+        sys.exit(1)
 
     if args.compile_to:
         scanner.save_compiled_rules(args.compile_to)
