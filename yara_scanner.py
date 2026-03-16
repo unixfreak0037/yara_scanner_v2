@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # vim: sw=4:ts=4:et:cc=120
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 __doc__ = """
 Yara Scanner v2
 ============
@@ -1812,6 +1812,15 @@ def main():
     )
 
     parser.add_argument(
+        "--meta-tags",
+        required=False,
+        default=[],
+        action="append",
+        dest="meta_tags",
+        help="A meta tag to pass to the scanner for rule filtering. You can specify more than one of these options.",
+    )
+
+    parser.add_argument(
         "-a",
         "--auto-compile-rules",
         default=False,
@@ -1909,7 +1918,7 @@ def main():
     def scan_file(file_path):
         global exit_result
         try:
-            if scanner.scan(file_path):
+            if scanner.scan(file_path, meta_tags=args.meta_tags or None):
                 if args.dump_json:
                     json.dump(scanner.scan_results, sys.stdout, sort_keys=True, indent=4, cls=YaraJSONEncoder)
                 else:
