@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # vim: sw=4:ts=4:et:cc=120
-__version__ = "2.1.1"
+__version__ = "2.1.2"
 __doc__ = """
 Yara Scanner v2
 ============
@@ -72,6 +72,7 @@ class RulesNotLoadedError(Exception):
 RESULT_KEY_TARGET = "target"
 RESULT_KEY_META = "meta"
 RESULT_KEY_NAMESPACE = "namespace"
+RESULT_KEY_COMMIT = "commit"
 RESULT_KEY_RULE = "rule"
 RESULT_KEY_STRINGS = "strings"
 RESULT_KEY_TAGS = "tags"
@@ -79,6 +80,7 @@ ALL_RESULT_KEYS = [
     RESULT_KEY_TARGET,
     RESULT_KEY_META,
     RESULT_KEY_NAMESPACE,
+    RESULT_KEY_COMMIT,
     RESULT_KEY_RULE,
     RESULT_KEY_STRINGS,
     RESULT_KEY_TAGS,
@@ -223,6 +225,7 @@ class YaraScanner(object):
                 'target': str,
                 'meta': dict,
                 'namespace': str,
+                'commit': str or None,
                 'rule': str,
                 'strings': list,
                 'tags': list,
@@ -233,6 +236,8 @@ class YaraScanner(object):
         **meta** is the dict of meta directives of the matching rule.
 
         **namespace** is the namespace the rule is in. In the case of repo and directory tracking, this will be the path of the directory. Otherwise it has a hard coded value of DEFAULT. *Setting the namespace to the path of the directory allows yara rules with duplicate names in different directories to be added to the same yara context.*
+
+        **commit** is the git commit hash the matching rule's source was tracked at, when the rule came from a git repository (see :func:`YaraScanner.track_yara_repository`). It is ``None`` for rules loaded from a directory, single file, or pre-compiled rules.
 
         **rule** is the name of the matching yara rule.
 
@@ -1107,6 +1112,7 @@ class YaraScanner(object):
                 "target": file_path,
                 "meta": result.meta,
                 "namespace": result.namespace,
+                "commit": self.tracked_repos.get(result.namespace),
                 "rule": result.rule,
                 "strings": strings,
                 "tags": result.tags,
@@ -1924,7 +1930,10 @@ def main():
                 else:
                     print(file_path)
                     for match in scanner.scan_results:
-                        print("\t{}".format(match["rule"]))
+                        if match["commit"]:
+                            print("\t{} ({})".format(match["rule"], match["commit"]))
+                        else:
+                            print("\t{}".format(match["rule"]))
         except Exception as e:
             log.error("scan failed for {}: {}".format(file_path, e))
             exit_result = 1

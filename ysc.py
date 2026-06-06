@@ -34,7 +34,10 @@ def main():
             else:
                 print("{}: {} rule matches".format(_file, len(scan_results)))
                 for match in scan_results:
-                    print('\t{}'.format(match['rule']))
+                    if match.get('commit'):
+                        print('\t{} ({})'.format(match['rule'], match['commit']))
+                    else:
+                        print('\t{}'.format(match['rule']))
 
 if __name__ == '__main__':
     main()
