@@ -7,10 +7,11 @@ from subprocess import Popen
 
 import pytest
 
-from yara_scanner import (ALL_RESULT_KEYS, RESULT_KEY_META,
+from yara_scanner import (ALL_RESULT_KEYS, RESULT_KEY_COMMIT, RESULT_KEY_META,
                           RESULT_KEY_NAMESPACE, RESULT_KEY_RULE,
                           RESULT_KEY_STRINGS, RESULT_KEY_TAGS,
-                          RESULT_KEY_TARGET, YaraScanner, __version__, RulesNotLoadedError)
+                          RESULT_KEY_TARGET, YaraScanner, __version__, RulesNotLoadedError,
+                          get_current_repo_commit)
 
 def create_file(path, content):
     dir = os.path.dirname(path)
@@ -69,6 +70,8 @@ def test_data_scan_results(scanner):
     assert scanner.scan_results[0][RESULT_KEY_TARGET] == ''
     assert scanner.scan_results[0][RESULT_KEY_META] == {}
     assert os.path.basename(scanner.scan_results[0][RESULT_KEY_NAMESPACE]) == 'ruleset_a'
+    # directory-tracked rules are not from a git repo, so there is no commit
+    assert scanner.scan_results[0][RESULT_KEY_COMMIT] is None
     assert scanner.scan_results[0][RESULT_KEY_RULE] == 'rule_1'
     assert scanner.scan_results[0][RESULT_KEY_STRINGS] == [(0, '$', b'test_rule_1')]
     assert scanner.scan_results[0][RESULT_KEY_TAGS] == ['tag_1']
@@ -84,6 +87,8 @@ def test_file_scan_results(scanner, shared_datadir):
     assert os.path.basename(scanner.scan_results[0][RESULT_KEY_TARGET]) == 'scan_target_1.txt'
     assert scanner.scan_results[0][RESULT_KEY_META] == {}
     assert os.path.basename(scanner.scan_results[0][RESULT_KEY_NAMESPACE]) == 'ruleset_a'
+    # directory-tracked rules are not from a git repo, so there is no commit
+    assert scanner.scan_results[0][RESULT_KEY_COMMIT] is None
     assert scanner.scan_results[0][RESULT_KEY_RULE] == 'rule_1'
     assert scanner.scan_results[0][RESULT_KEY_STRINGS] == [(0, '$', b'test_rule_1')]
     assert scanner.scan_results[0][RESULT_KEY_TAGS] == ['tag_1']
@@ -269,6 +274,16 @@ def test_repo_tracking(repo):
     assert s.check_rules()
     assert s.load_rules()
     assert not s.check_rules()
+
+@pytest.mark.integration
+@pytest.mark.skipif(not shutil.which('git'), reason="missing git in PATH")
+def test_repo_commit_in_scan_results(repo):
+    s = YaraScanner()
+    s.track_yara_repository(repo)
+    assert s.load_rules()
+    # matches ruleset_a/rule_1.yar which came from the git repo
+    assert s.scan_data('test_rule_1')
+    assert s.scan_results[0][RESULT_KEY_COMMIT] == get_current_repo_commit(repo)
 
 #region meta_rule_tests
 meta_rule_tests = [
