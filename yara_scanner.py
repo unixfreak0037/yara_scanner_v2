@@ -132,6 +132,28 @@ def get_rules_md5(namespaces: Dict[str, List[str]]) -> str:
     return m.hexdigest()
 
 
+# yara's # count operator only works on a single named string, not a $prefix* wildcard set
+WILDCARD_STRING_COUNT_RE = re.compile(r"#(?P<prefix>[A-Za-z_]\w*)\*")
+STRING_DECLARATION_RE = re.compile(r"^\s*\$(?P<ident>[A-Za-z_]\w*)\s*=", re.MULTILINE)
+
+
+def expand_wildcard_string_counts(source: str) -> str:
+    """Expands #prefix* into #prefix1 + #prefix2 + ... for every $prefix... string
+    declared in the given yara source. A wildcard with no matching strings is left
+    untouched so yara's own "undefined identifier" compile error surfaces normally."""
+    declared_idents = STRING_DECLARATION_RE.findall(source)
+
+    def _expand(match):
+        prefix = match.group("prefix")
+        matching_idents = [ident for ident in declared_idents if ident.startswith(prefix)]
+        if not matching_idents:
+            return match.group(0)
+
+        return "(" + " + ".join(f"#{ident}" for ident in matching_idents) + ")"
+
+    return WILDCARD_STRING_COUNT_RE.sub(_expand, source)
+
+
 class YaraJSONEncoder(json.JSONEncoder):
     def default(self, o):
         if isinstance(o, bytes):
@@ -488,7 +510,7 @@ class YaraScanner(object):
                     bar.next()
 
                 with open(file_path, "r") as fp:
-                    yara_source = fp.read()
+                    yara_source = expand_wildcard_string_counts(fp.read())
 
                 parser = plyara.Plyara()
                 for parsed_rule in parser.parse_string(yara_source):
@@ -785,7 +807,7 @@ class YaraScanner(object):
 
             try:
                 with open(relative_path, "r") as fp:
-                    return fp.read()
+                    return expand_wildcard_string_counts(fp.read())
             except Exception as e:
                 log.error("unable to include file %s: %s", relative_path, e)
                 return ""
@@ -831,7 +853,7 @@ class YaraScanner(object):
 
                 with open(file_path, "r") as fp:
                     log.debug("loading namespace {} rule file {}".format(namespace, file_path))
-                    data = fp.read()
+                    data = expand_wildcard_string_counts(fp.read())
 
                     try:
                         # compile each file individually first, make sure that works

@@ -6,12 +6,13 @@ import time
 from subprocess import Popen
 
 import pytest
+import yara
 
 from yara_scanner import (ALL_RESULT_KEYS, RESULT_KEY_COMMIT, RESULT_KEY_META,
                           RESULT_KEY_NAMESPACE, RESULT_KEY_RULE,
                           RESULT_KEY_STRINGS, RESULT_KEY_TAGS,
                           RESULT_KEY_TARGET, YaraScanner, __version__, RulesNotLoadedError,
-                          get_current_repo_commit)
+                          get_current_repo_commit, expand_wildcard_string_counts)
 
 def create_file(path, content):
     dir = os.path.dirname(path)
@@ -22,6 +23,113 @@ def create_file(path, content):
         fp.write(content)
 
     return path
+
+@pytest.mark.unit
+def test_expand_wildcard_string_counts_single_wildcard():
+    source = """
+rule test_rule {
+    strings:
+        $highconfidence1 = "foo"
+        $highconfidence2 = "bar"
+    condition:
+        #highconfidence* >= 1
+}
+"""
+    expanded = expand_wildcard_string_counts(source)
+    assert "#highconfidence*" not in expanded
+    assert "(#highconfidence1 + #highconfidence2)" in expanded
+
+@pytest.mark.unit
+def test_expand_wildcard_string_counts_multiple_wildcards_independently():
+    source = """
+rule test_rule {
+    strings:
+        $highconfidence1 = "foo"
+        $midconfidence1 = "bar"
+        $midconfidence2 = "baz"
+    condition:
+        (3 * #highconfidence* + 2 * #midconfidence*) >= 3
+}
+"""
+    expanded = expand_wildcard_string_counts(source)
+    assert "(3 * (#highconfidence1) + 2 * (#midconfidence1 + #midconfidence2)) >= 3" in expanded
+
+@pytest.mark.unit
+def test_expand_wildcard_string_counts_leaves_no_match_untouched():
+    # a wildcard with zero matching declared strings is left as-is so yara's own
+    # "undefined identifier" compile error surfaces normally, instead of this
+    # function silently producing something that compiles but is wrong
+    source = """
+rule test_rule {
+    strings:
+        $a1 = "foo"
+    condition:
+        #doesnotexist* >= 1
+}
+"""
+    expanded = expand_wildcard_string_counts(source)
+    assert "#doesnotexist*" in expanded
+
+    with pytest.raises(yara.SyntaxError):
+        yara.compile(source=expanded)
+
+@pytest.mark.unit
+def test_expand_wildcard_string_counts_leaves_non_wildcard_untouched():
+    source = """
+rule test_rule {
+    strings:
+        $a1 = "foo"
+        $a2 = "bar"
+    condition:
+        #a1 >= 1
+}
+"""
+    expanded = expand_wildcard_string_counts(source)
+    assert expanded == source
+
+@pytest.mark.unit
+def test_expand_wildcard_string_counts_expanded_rule_compiles_and_matches():
+    source = """
+rule test_rule {
+    strings:
+        $highconfidence1 = "foo"
+        $highconfidence2 = "bar"
+        $midconfidence1 = "baz"
+    condition:
+        (3 * #highconfidence* + 2 * #midconfidence*) >= 3
+}
+"""
+    expanded = expand_wildcard_string_counts(source)
+    rules = yara.compile(source=expanded)
+
+    # a single highconfidence hit (weight 3) meets the threshold on its own
+    assert rules.match(data=b"foo")
+    # no matches at all should not meet the threshold
+    assert not rules.match(data=b"nothing relevant here")
+    # a single midconfidence hit alone (weight 2) should not meet the threshold
+    assert not rules.match(data=b"baz")
+
+@pytest.mark.integration
+def test_wildcard_string_counts_via_scanner(tmp_path):
+    """Confirms the expansion is actually applied when the scanner loads a rule file from disk."""
+    rule_content = """
+rule test_wildcard_scan {
+meta:
+    author = "test"
+strings:
+    $highconfidence1 = "foo"
+    $highconfidence2 = "bar"
+condition:
+    #highconfidence* >= 2
+}
+    """
+    scanner = YaraScanner()
+    yara_rule_path = create_file(str(tmp_path / 'rule.yar'), rule_content)
+    scanner.track_yara_file(yara_rule_path)
+    scanner.load_rules()
+
+    assert scanner.scan_data('foo bar')
+    assert not scanner.scan_data('foo')
 
 @pytest.fixture
 def scanner(shared_datadir):
