@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # vim: sw=4:ts=4:et:cc=120
-__version__ = "2.1.2"
+__version__ = "2.1.3"
 __doc__ = """
 Yara Scanner v2
 ============
@@ -1189,8 +1189,12 @@ class YaraScannerServer(object):
         default_timeout=5,
     ):
 
+        # Python 3.14+ defaults to forkserver, which cannot pickle bound-method
+        # Process targets that reference this server (and its live Process list).
+        self.mp_ctx = multiprocessing.get_context("fork")
+
         # set to True to gracefully shutdown
-        self.shutdown = multiprocessing.Event()
+        self.shutdown = self.mp_ctx.Event()
 
         # set to True to gracefully shutdown the current scanner (used for reloading)
         self.current_scanner_shutdown = None  # threading.Event
@@ -1282,7 +1286,7 @@ class YaraScannerServer(object):
         for i, scanner in enumerate(self.servers):
             if scanner is None:
                 logging.info("starting scanner on cpu {}".format(i))
-                self.servers[i] = multiprocessing.Process(
+                self.servers[i] = self.mp_ctx.Process(
                     target=self.run, name="Yara Scanner Server ({})".format(i), args=(i,)
                 )
                 self.servers[i].start()
@@ -1330,7 +1334,7 @@ class YaraScannerServer(object):
         self.scanner = new_scanner
 
     def start(self):
-        self.process_manager = multiprocessing.Process(target=self.run_process_manager)
+        self.process_manager = self.mp_ctx.Process(target=self.run_process_manager)
         self.process_manager.start()
         log.info("started process manager on pid {}".format(self.process_manager.pid))
 
