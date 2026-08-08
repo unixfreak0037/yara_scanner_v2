@@ -18,6 +18,10 @@ def main():
         help="Path to the logging configuration file.")
     parser.add_argument('-d', '--signature-dir', required=False, default='/opt/signatures',
         help="The signature directory to load. Defaults to /opt/signatures")
+    parser.add_argument('--git-repo-dir', required=False, default=[], action='append', dest='git_repo_dirs',
+        help="A subdirectory of --signature-dir that is part of a git repository. Only commits to the "
+             "repository trigger a rule reload and matching rules report the commit. "
+             "You can specify more than one of these.")
     parser.add_argument('-s', '--socket-dir', required=False, default='socket',
         help="The directory (relative to --base-dir) that contains the unix sockets.")
     parser.add_argument('-u', '--update-frequency', required=False, default=60, type=int,
@@ -173,6 +177,7 @@ def main():
     server = YaraScannerServer(
         base_dir=args.base_dir, 
         signature_dir=args.signature_dir,
+        git_repo_dirs=args.git_repo_dirs,
         socket_dir=args.socket_dir,
         update_frequency=args.update_frequency,
         backlog=args.backlog)

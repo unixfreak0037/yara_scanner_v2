@@ -100,7 +100,7 @@ optional arguments:
   -Y YARA_DIRS, --yara-dirs YARA_DIRS
                         One directory containing yara rules to load. You can specify more than one of these.
   -G YARA_REPOS, --yara-repos YARA_REPOS
-                        One directory that is a git repository that contains yara rules to load. You can specify more than one of these.
+                        One directory that is part of a git repository that contains yara rules to load. You can specify more than one of these.
   -z COMPILED_YARA_RULES, --compiled-yara-rules COMPILED_YARA_RULES
                         Load compiled yara rules from the specified files. This option cannot be combined with -y, -Y, or -G
   -c, --compile-only    Compile the rules and exit.
@@ -116,6 +116,8 @@ optional arguments:
                         Specifies the directory to use to store automatically compiled yara rules. Defaults to the system temp dir.
   -d SIGNATURE_DIR, --signature-dir SIGNATURE_DIR
                         DEPRECATED: Use a different signature directory than the default.
+  --git-repo-dir GIT_REPO_DIRS
+                        A subdirectory of --signature-dir that is part of a git repository. Only commits to the repository trigger a rule reload and matching rules report the commit. You can specify more than one of these.
    ```
 
 ## Command Line Examples
