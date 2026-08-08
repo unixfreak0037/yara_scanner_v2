@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # vim: sw=4:ts=4:et:cc=120
-__version__ = "2.1.3"
+__version__ = "2.1.4"
 __doc__ = """
 Yara Scanner v2
 ============
@@ -152,6 +152,7 @@ class YaraScanner(object):
         auto_compile_rules=False,
         auto_compiled_rules_dir=None,
         default_timeout=5,
+        git_repo_dirs=None,
     ):
         """
         Creates a new YaraScanner object.
@@ -163,6 +164,13 @@ class YaraScanner(object):
         :func:`YaraScanner.track_yara_dir`, and
         :func:`YaraScanner.track_yara_repo`.
 
+        :param git_repo_dirs: The subdirectories of signature_dir that are part
+        of a git repository. These are tracked with
+        :func:`YaraScanner.track_yara_repository` (only new commits trigger a
+        rule reload, and matches report the commit hash.) Every other
+        subdirectory is tracked with :func:`YaraScanner.track_yara_dir`. Entries
+        can be the name of the subdirectory or a path to it. 
+
         :param compile_rules: Set to True to save and load compiled rules using
         the compiled_rules_dir. Defaults to False.
 
@@ -170,6 +178,7 @@ class YaraScanner(object):
         If this is left as None then the system temporary directory is used.
 
         :type signature_dir: str or None
+        :type git_repo_dirs: list[str] or None
 
 
         """
@@ -202,15 +211,27 @@ class YaraScanner(object):
 
         # if a "signature directory" is specific then we automatically start tracking rules
         if signature_dir is not None and os.path.isdir(signature_dir):
+            # which of these directories did the caller say are part of a git repository?
+            git_repo_paths = {self._resolve_signature_subdir(signature_dir, _) for _ in (git_repo_dirs or [])}
+            tracked_repo_paths = set()
+
             for dir_path in os.listdir(signature_dir):
                 dir_path = os.path.join(signature_dir, dir_path)
                 if not os.path.isdir(dir_path):
                     continue
 
-                if os.path.exists(os.path.join(dir_path, ".git")):
+                resolved_path = os.path.realpath(dir_path)
+                if resolved_path in git_repo_paths:
+                    tracked_repo_paths.add(resolved_path)
                     self.track_yara_repository(dir_path)
                 else:
                     self.track_yara_dir(dir_path)
+
+            for missing_path in git_repo_paths - tracked_repo_paths:
+                log.error("{} is not a directory in signature directory {}".format(missing_path, signature_dir))
+
+        elif git_repo_dirs:
+            log.error("git_repo_dirs was specified without a valid signature_dir: it has no effect")
 
         # the default amount of time (in seconds) a yara scan is allowed to take before it fails
         self.default_timeout = default_timeout
@@ -279,6 +300,15 @@ class YaraScanner(object):
         """Returns True if git is available on the system, False otherwise."""
         return shutil.which("git")
 
+    @staticmethod
+    def _resolve_signature_subdir(signature_dir, dir_path):
+        """Returns the resolved path of a subdirectory of the given signature directory.
+        dir_path can be the name of the subdirectory or a path to it."""
+        if not os.path.isabs(dir_path):
+            dir_path = os.path.join(signature_dir, dir_path)
+
+        return os.path.realpath(dir_path)
+
     def track_compiled_yara_file(self, file_path):
         """Tracks the given file that contains compiled yara rules."""
         self.tracked_compiled_path = file_path
@@ -313,7 +343,12 @@ class YaraScanner(object):
         log.debug("tracking directory {} with {} yara files".format(dir_path, len(self.tracked_dirs[dir_path])))
 
     def track_yara_repository(self, dir_path):
-        """Adds all files in a given directory **that is a git repository** that end with .yar when converted to lowercase.  Only commits to the repository trigger rule reload."""
+        """Adds all files in a given directory **that is part of a git repository** that end with .yar when converted to lowercase.  Only commits to the repository trigger rule reload.
+
+        The directory does not have to be the root of the repository. Any
+        directory inside of one works, in which case the commit that is tracked
+        (and reported with matching rules) is the current commit of the
+        repository the directory belongs to."""
         if not self.git_available():
             log.warning("git cannot be found: defaulting to track_yara_dir")
             return self.track_yara_dir(dir_path)
@@ -322,12 +357,15 @@ class YaraScanner(object):
             log.error("{} is not a directory".format(dir_path))
             return False
 
-        if not os.path.exists(os.path.join(dir_path, ".git")):
-            log.error("{} is not a git repository (missing .git)".format(dir_path))
+        # get the initial commit of this directory
+        # NOTE we do not look for a .git directory here because dir_path can be
+        # a subdirectory of the repository, in which case .git is in a parent directory
+        current_commit = get_current_repo_commit(dir_path)
+        if current_commit is None:
+            log.error("{} is not part of a git repository".format(dir_path))
             return False
 
-        # get the initial commit of this directory
-        self.tracked_repos[dir_path] = get_current_repo_commit(dir_path)
+        self.tracked_repos[dir_path] = current_commit
         log.debug("tracking git repo {} @ {}".format(dir_path, self.tracked_repos[dir_path]))
 
     def check_rules(self):
@@ -1187,6 +1225,7 @@ class YaraScannerServer(object):
         update_frequency=60,
         backlog=50,
         default_timeout=5,
+        git_repo_dirs=None,
     ):
 
         # Python 3.14+ defaults to forkserver, which cannot pickle bound-method
@@ -1211,6 +1250,9 @@ class YaraScannerServer(object):
 
         # the directory that contains the signatures to load
         self.signature_dir = signature_dir
+
+        # the subdirectories of signature_dir that are part of a git repository
+        self.git_repo_dirs = git_repo_dirs
 
         # the directory that contains the unix sockets
         self.socket_dir = socket_dir
@@ -1329,7 +1371,11 @@ class YaraScannerServer(object):
 
     def initialize_scanner(self):
         log.info("initializing scanner")
-        new_scanner = YaraScanner(signature_dir=self.signature_dir, default_timeout=self.default_timeout)
+        new_scanner = YaraScanner(
+            signature_dir=self.signature_dir,
+            default_timeout=self.default_timeout,
+            git_repo_dirs=self.git_repo_dirs,
+        )
         new_scanner.load_rules()
         self.scanner = new_scanner
 
@@ -1784,7 +1830,7 @@ def main():
         default=[],
         action="append",
         dest="yara_repos",
-        help="One directory that is a git repository that contains yara rules to load. You can specify more than one of these.",
+        help="One directory that is part of a git repository that contains yara rules to load. You can specify more than one of these.",
     )
     parser.add_argument(
         "-z",
@@ -1853,6 +1899,18 @@ def main():
         help="DEPRECATED: Use a different signature directory than the default.",
     )
 
+    parser.add_argument(
+        "--git-repo-dir",
+        required=False,
+        default=[],
+        action="append",
+        dest="git_repo_dirs",
+        help="""A subdirectory of --signature-dir that is part of a git
+        repository. Only commits to the repository trigger a rule reload and
+        matching rules report the commit. You can specify more than one of
+        these.""",
+    )
+
     args = parser.parse_args()
 
     if (
@@ -1876,6 +1934,7 @@ def main():
         signature_dir=args.signature_dir,
         auto_compile_rules=args.auto_compile_rules,
         auto_compiled_rules_dir=args.auto_compiled_rules_dir,
+        git_repo_dirs=args.git_repo_dirs,
     )
     scanner.blacklist = args.blacklisted_rules
 

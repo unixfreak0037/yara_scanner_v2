@@ -39,6 +39,18 @@ def repo(shared_datadir):
     Popen(['git', '-C', repo_path, 'commit', '-m', 'initial commit']).wait()
     return repo_path
 
+@pytest.fixture
+def parent_repo(shared_datadir):
+    # a git repository that *contains* the signature directory
+    # the rule directories are inside of it but have no .git directory of their own
+    repo_path = str(shared_datadir)
+    Popen(['git', '-C', repo_path, 'init']).wait()
+    Popen(['git', '-C', repo_path, 'config', 'user.name', 'Test User']).wait()
+    Popen(['git', '-C', repo_path, 'config', 'user.email', 'test_user@localhost']).wait()
+    Popen(['git', '-C', repo_path, 'add', '-A']).wait()
+    Popen(['git', '-C', repo_path, 'commit', '-m', 'initial commit']).wait()
+    return repo_path
+
 @pytest.mark.integration
 def test_signature_dir_load(scanner):
     # there should be two loaded directories
@@ -284,6 +296,83 @@ def test_repo_commit_in_scan_results(repo):
     # matches ruleset_a/rule_1.yar which came from the git repo
     assert s.scan_data('test_rule_1')
     assert s.scan_results[0][RESULT_KEY_COMMIT] == get_current_repo_commit(repo)
+
+@pytest.mark.integration
+@pytest.mark.skipif(not shutil.which('git'), reason="missing git in PATH")
+def test_signature_dir_git_repo_dirs(repo, shared_datadir):
+    signature_dir = str(shared_datadir / 'signatures')
+    repo_dir = str(shared_datadir / 'signatures' / 'ruleset_a')
+    plain_dir = str(shared_datadir / 'signatures' / 'ruleset_b')
+
+    # the caller says which directories are part of a git repository
+    s = YaraScanner(signature_dir=signature_dir, git_repo_dirs=['ruleset_a'])
+    assert list(s.tracked_repos.keys()) == [repo_dir]
+    assert s.tracked_repos[repo_dir] == get_current_repo_commit(repo)
+    assert list(s.tracked_dirs.keys()) == [plain_dir]
+
+    # entries can also be paths instead of names
+    s = YaraScanner(signature_dir=signature_dir, git_repo_dirs=[repo_dir])
+    assert list(s.tracked_repos.keys()) == [repo_dir]
+    assert list(s.tracked_dirs.keys()) == [plain_dir]
+
+@pytest.mark.integration
+@pytest.mark.skipif(not shutil.which('git'), reason="missing git in PATH")
+def test_signature_dir_no_git_repo_autodetection(repo, shared_datadir):
+    # ruleset_a is a git repository but the caller did not say so, so it is
+    # tracked as a plain directory
+    s = YaraScanner(signature_dir=str(shared_datadir / 'signatures'))
+    assert not s.tracked_repos
+    assert len(s.tracked_dirs) == 2
+    assert s.load_rules()
+    assert s.scan_data('test_rule_1')
+    assert s.scan_results[0][RESULT_KEY_COMMIT] is None
+
+@pytest.mark.integration
+@pytest.mark.skipif(not shutil.which('git'), reason="missing git in PATH")
+def test_track_subdirectory_of_repo(parent_repo):
+    ruleset_dir = os.path.join(parent_repo, 'signatures', 'ruleset_a')
+    # the rule directory is inside the repository but has no .git of its own
+    assert not os.path.exists(os.path.join(ruleset_dir, '.git'))
+
+    s = YaraScanner()
+    assert s.track_yara_repository(ruleset_dir) is not False
+    assert s.tracked_repos[ruleset_dir] == get_current_repo_commit(parent_repo)
+    assert s.load_rules()
+    assert s.scan_data('test_rule_1')
+    assert s.scan_results[0][RESULT_KEY_COMMIT] == get_current_repo_commit(parent_repo)
+
+@pytest.mark.integration
+@pytest.mark.skipif(not shutil.which('git'), reason="missing git in PATH")
+def test_signature_dir_subdirectory_of_repo(parent_repo):
+    signature_dir = os.path.join(parent_repo, 'signatures')
+    ruleset_dir = os.path.join(signature_dir, 'ruleset_a')
+
+    s = YaraScanner(signature_dir=signature_dir, git_repo_dirs=['ruleset_a'])
+    assert s.tracked_repos[ruleset_dir] == get_current_repo_commit(parent_repo)
+    assert s.load_rules()
+    assert s.scan_data('test_rule_1')
+    assert s.scan_results[0][RESULT_KEY_COMMIT] == get_current_repo_commit(parent_repo)
+
+@pytest.mark.integration
+@pytest.mark.skipif(not shutil.which('git'), reason="missing git in PATH")
+def test_track_yara_repository_non_repo(tmp_path):
+    # a directory that is not part of any git repository is still rejected
+    yara_dir = tmp_path / 'not_a_repo'
+    create_file(str(yara_dir / 'rule_1.yar'), 'rule rule_1 { condition: true }')
+
+    s = YaraScanner()
+    assert s.track_yara_repository(str(yara_dir)) is False
+    assert not s.tracked_repos
+
+@pytest.mark.integration
+def test_git_repo_dirs_unknown_entry(shared_datadir, caplog):
+    signature_dir = str(shared_datadir / 'signatures')
+    with caplog.at_level(logging.WARNING, logger='yara-scanner'):
+        s = YaraScanner(signature_dir=signature_dir, git_repo_dirs=['ruleset_missing'])
+
+    assert not s.tracked_repos
+    assert len(s.tracked_dirs) == 2
+    assert 'ruleset_missing' in caplog.text
 
 #region meta_rule_tests
 meta_rule_tests = [
