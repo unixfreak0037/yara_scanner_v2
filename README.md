@@ -6,7 +6,6 @@ A wrapper around the [yara-python](https://github.com/VirusTotal/yara-python) pr
 
 - Change tracking of yara files, directories of yara files, or git repositories of yara files.
 - File and data scanning with the ability to filter based on meta data matching.
-- Distributed scanning processes that maximize the use of multi-core systems.
 - Command line interface.
 
 This is built specifically for the [Analysis Correlation Engine v3](https://github.com/unixfreak0037/ace3) project.
@@ -284,11 +283,6 @@ scanner.scan('/path/to/file', meta_tags=["email_attachment", "suspicious"])
 scanner.scan_data(data, meta_tags=["email_attachment"])
 ```
 
-Via the client CLI:
-
-```bash
-ysc --meta-tags email_attachment suspicious /path/to/file
-```
 
 ## Yara Rule Performance Testing
 

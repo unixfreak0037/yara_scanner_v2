@@ -997,3 +997,34 @@ condition:
     # with no tags
     assert not scanner.scan_data('Sample content.', meta_tags=None)
     assert len(scanner.scan_results) == 0
+
+@pytest.mark.integration
+def test_rules_changed_without_loading(tmp_path):
+    """rules_changed() reports source changes only, so rules can be watched without compiling them."""
+    yara_rule_path = create_file(str(tmp_path / 'rule.yar'), 'rule a { condition: true }')
+    scanner = YaraScanner()
+    scanner.track_yara_file(yara_rule_path)
+
+    # never loaded: check_rules() wants a load, rules_changed() sees no change
+    assert scanner.check_rules()
+    assert not scanner.rules_changed()
+    assert scanner.rules is None
+
+    os.utime(yara_rule_path, (time.time() + 10, time.time() + 10))
+    assert scanner.rules_changed()
+    # the change was tracked, so it is reported once
+    assert not scanner.rules_changed()
+    assert scanner.rules is None
+
+@pytest.mark.integration
+def test_scan_does_not_modify_external_vars(tmp_path):
+    yara_rule_path = create_file(str(tmp_path / 'rule.yar'), 'rule a { strings: $ = "Sample" condition: all of them }')
+    scan_target_path = create_file(str(tmp_path / 'target.txt'), 'Sample content.')
+    scanner = YaraScanner()
+    scanner.track_yara_file(yara_rule_path)
+    scanner.load_rules()
+
+    external_vars = {"filetype": "text"}
+    assert scanner.scan(scan_target_path, external_vars=external_vars, meta_tags=["email_attachment"])
+    assert scanner.scan_data('Sample content.', external_vars=external_vars, meta_tags=["email_attachment"])
+    assert external_vars == {"filetype": "text"}

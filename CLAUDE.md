@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-YARA Scanner v2 is a Python wrapper around yara-python that provides change tracking of YARA rules, metadata-based scan filtering, and distributed multi-process scanning via Unix sockets. Built for the ACE3 project.
+YARA Scanner v2 is a Python wrapper around yara-python that provides change tracking of YARA rules and metadata-based scan filtering. Built for the ACE3 project.
+
+The multi-process scanning client/server (`YaraScannerServer`, `ysc`, `yss`) was removed in 3.0.0; it now lives in ACE itself (`saq/yara_scanning/`).
 
 ## Commands
 
@@ -12,7 +14,7 @@ YARA Scanner v2 is a Python wrapper around yara-python that provides change trac
 # Install dependencies
 pip install -r requirements.txt
 pip install -r requirements-dev.txt
-pip install -e .  # editable install, creates console scripts: scan, ysc, yss
+pip install -e .  # editable install, creates the scan console script
 
 # Run all tests
 pytest
@@ -25,23 +27,16 @@ pytest -m unit
 pytest -m integration
 
 # Lint
-pylint yara_scanner.py ysc.py yss.py
+pylint yara_scanner.py
 ```
 
 ## Architecture
 
-The codebase is three flat Python modules (no package directory):
+The codebase is a single flat Python module (no package directory):
 
-- **yara_scanner.py** — Core module (~1900 lines). Contains:
+- **yara_scanner.py** — Core module (~1500 lines). Contains:
   - `YaraScanner` — Main class. Tracks rule sources (files, directories, git repos), compiles rules with dependency resolution via plyara, scans files/data, and filters results based on rule metadata (`file_ext`, `mime_type`, `file_name`, `full_path` with `sub:`, `re:`, `!` modifiers).
-  - `YaraScannerServer` — Multi-process server. Spawns one scanner process per CPU core, communicates over Unix sockets, monitors rules for changes, and auto-reloads (by respawning workers to avoid memory leaks).
   - `main()` — CLI entry point for the `scan` command. Includes performance testing mode that tests individual rules/strings against random and repeating-byte buffers.
-- **ysc.py** — Lightweight client that connects to the scanner server socket to request scans.
-- **yss.py** — Server daemon manager (start/stop/daemonize the `YaraScannerServer`).
-
-### Client-Server Protocol
-
-Unix socket protocol: command byte (`1`=file path, `2`=data stream), then data blocks as `(unsigned int length + bytes)`, external vars as JSON. Response is pickled scan results or exception.
 
 ### Scan Result Structure
 
@@ -51,7 +46,7 @@ Unix socket protocol: command byte (`1`=file path, `2`=data stream), then data b
 
 ### Rule Change Detection
 
-Three tracking strategies with unified interface: single files (mtime-based), directories (tracks .yar/.yara additions/changes/deletions), git repos (triggers only on new commits).
+Three tracking strategies with unified interface: single files (mtime-based), directories (tracks .yar/.yara additions/changes/deletions), git repos (triggers only on new commits). `rules_changed()` reports (and re-tracks) source changes only; `check_rules()` additionally returns True while no rules are loaded, so a watcher that never compiles must use `rules_changed()`.
 
 ## Testing
 
