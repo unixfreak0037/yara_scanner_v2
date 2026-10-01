@@ -10,14 +10,14 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 
 setup(
     name="yara_scanner_v2",
-    version="2.1.4",
+    version="3.0.0",
     author="John Davison",
     author_email="unixfreak0037@gmail.com",
-    description="A Python wrapper library for libyara and a local server for fully utilizing the CPUs of the system to scan with yara.",
+    description="A Python wrapper library for libyara with rule change tracking and metadata-based result filtering.",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/unixfreak0037/yara_scanner_v2",
-    py_modules=["yara_scanner", "ysc", "yss"],
+    py_modules=["yara_scanner"],
     install_requires=requirements,
     python_requires=">=3.11",
     classifiers=[
@@ -31,8 +31,6 @@ setup(
     entry_points={
         "console_scripts": [
             "scan=yara_scanner:main",
-            "ysc=ysc:main",
-            "yss=yss:main",
         ],
     },
     license="Apache-2.0",

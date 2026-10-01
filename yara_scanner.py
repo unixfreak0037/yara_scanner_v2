@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # vim: sw=4:ts=4:et:cc=120
-__version__ = "2.1.4"
+__version__ = "3.0.0"
 __doc__ = """
 Yara Scanner v2
 ============
@@ -38,18 +38,11 @@ import functools
 import io
 import json
 import logging
-import multiprocessing
 import os
 import os.path
-import pickle
-import random
 import re
 import shutil
-import signal
-import socket
-import struct
 import sys
-import threading
 import time
 
 from operator import itemgetter
@@ -372,7 +365,24 @@ class YaraScanner(object):
         """
         Returns True if the rules need to be recompiled or reloaded, False
         otherwise. The criteria that determines if the rules are recompiled
-        depends on how they are tracked.
+        depends on how they are tracked. Rules that were never loaded always
+        need to be loaded (unless they are tracked as a compiled file.)
+
+        :rtype: bool"""
+
+        changed = self.rules_changed()
+        if self.tracked_compiled_path:
+            return changed
+
+        # if we don't have a yara context yet then we def need to compile the rules
+        return changed or self.rules is None
+
+    def rules_changed(self):
+        """
+        Returns True if any tracked rule source changed since it was last
+        tracked, False otherwise, and starts tracking the new state. Unlike
+        :func:`YaraScanner.check_rules` this does not care whether rules were
+        ever loaded, so it can be used to watch rules without compiling them.
 
         :rtype: bool"""
 
@@ -450,10 +460,6 @@ class YaraScanner(object):
                 log.info("detected change in git repo {}".format(repo_path))
                 self.track_yara_repository(repo_path)
                 reload_rules = True
-
-        # if we don't have a yara context yet then we def need to compile the rules
-        if self.rules is None:
-            return True
 
         return reload_rules
 
@@ -917,13 +923,6 @@ class YaraScanner(object):
         :rtype: bool
         """
 
-        # defensive copy to avoid mutating caller's dict
-        external_vars = dict(external_vars)
-        # extract piggybacked meta_tags from ext_vars (used by client-server protocol)
-        _piggybacked = external_vars.pop("__meta_tags", None)
-        if _piggybacked and not meta_tags:
-            meta_tags = _piggybacked
-
         # default external variables
         default_external_vars = {
             "filename": os.path.basename(file_path),
@@ -970,13 +969,6 @@ class YaraScanner(object):
         """
 
         assert self.rules is not None
-
-        # defensive copy to avoid mutating caller's dict
-        external_vars = dict(external_vars)
-        # extract piggybacked meta_tags from ext_vars (used by client-server protocol)
-        _piggybacked = external_vars.pop("__meta_tags", None)
-        if _piggybacked and not meta_tags:
-            meta_tags = _piggybacked
 
         if not timeout:
             timeout = self.default_timeout
@@ -1181,495 +1173,6 @@ class YaraScanner(object):
     @property
     def has_matches(self):
         return len(self.scan_results) != 0
-
-
-# typically you might want to start a process, load the rules, then fork() for each client to scan
-# the idea being the each child process will be reusing the same yara rules loaded in memory
-# in practice, the yara rules compile into some kind of huge blob inside libyara
-# and the amount of time it takes the kernel to the clone() seems to gradually increase as a result of that
-# so the rules are loaded into each process and are reused until re-loaded
-
-#
-# each scanner listens on a local unix socket for new things to scan
-# once connected the following protocol is observed
-# client sends one byte with the following possible values
-# 1) what follows is a data stream
-# 2) what follows is a file path
-# in either case the client sends an unsigned integer in network byte order
-# that is the size of the following data (either data stream or file name)
-# finally the client sends another unsigned integer in network byte order
-# followed by a JSON hash of all the external variables to define for the scan
-# a size of 0 would indicate an empty JSON file
-#
-# once received the scanner will scan the data (or the file) and submit a result back to the client
-# the result will be a data block with one of the following values
-# * an empty block meaning no matches
-# * a pickled exception for yara scanning failures
-# * a pickled result dictionary
-# then the server will close the connection
-
-COMMAND_FILE_PATH = b"1"
-COMMAND_DATA_STREAM = b"2"
-
-DEFAULT_BASE_DIR = "/opt/yara_scanner"
-DEFAULT_SIGNATURE_DIR = "/opt/signatures"
-DEFAULT_SOCKET_DIR = "socket"
-
-
-class YaraScannerServer(object):
-    def __init__(
-        self,
-        base_dir=DEFAULT_BASE_DIR,
-        signature_dir=DEFAULT_SIGNATURE_DIR,
-        socket_dir=DEFAULT_SOCKET_DIR,
-        update_frequency=60,
-        backlog=50,
-        default_timeout=5,
-        git_repo_dirs=None,
-    ):
-
-        # Python 3.14+ defaults to forkserver, which cannot pickle bound-method
-        # Process targets that reference this server (and its live Process list).
-        self.mp_ctx = multiprocessing.get_context("fork")
-
-        # set to True to gracefully shutdown
-        self.shutdown = self.mp_ctx.Event()
-
-        # set to True to gracefully shutdown the current scanner (used for reloading)
-        self.current_scanner_shutdown = None  # threading.Event
-
-        # primary scanner controller
-        self.process_manager = None
-
-        # list of YaraScannerServer Process objects
-        # there will be one per cpu available as returned by multiprocessing.cpu_count()
-        self.servers = [None for _ in range(multiprocessing.cpu_count())]
-
-        # base directory of yara scanner
-        self.base_dir = base_dir
-
-        # the directory that contains the signatures to load
-        self.signature_dir = signature_dir
-
-        # the subdirectories of signature_dir that are part of a git repository
-        self.git_repo_dirs = git_repo_dirs
-
-        # the directory that contains the unix sockets
-        self.socket_dir = socket_dir
-
-        # how often do we check to see if the yara rules changed? (in seconds)
-        self.update_frequency = update_frequency
-
-        # parameter to the socket.listen() function (how many connections to backlog)
-        self.backlog = backlog
-
-        #
-        # the following variables are specific to the child proceses
-        #
-
-        # the "cpu index" of this process (used to determine the name of the unix socket)
-        self.cpu_index = None
-
-        # the path to the unix socket this process is using
-        self.socket_path = None
-
-        # the socket we are listening on for scan requests
-        self.server_socket = None
-
-        # the scanner we're using for this process
-        self.scanner = None
-
-        # set to True when we receive a SIGUSR1
-        self.sigusr1 = False
-        
-        # save default timeout to use for scanner
-        self.default_timeout = default_timeout
-
-    #
-    # scanning processes die when they need to reload rules
-    # this is due to what seems like a minor memory leak in the yara python library
-    # so this process just watches for dead scanners and restarts them if the system isn't stopping
-    #
-
-    def run_process_manager(self):
-        def _handler(signum, frame):
-            self.shutdown.set()
-
-        signal.signal(signal.SIGTERM, _handler)
-        signal.signal(signal.SIGINT, _handler)
-
-        try:
-            while not self.shutdown.is_set():
-                try:
-                    self.execute_process_manager()
-                    time.sleep(0.1)
-                except Exception as e:
-                    log.error("uncaught exception: {}".format(e))
-                    time.sleep(1)
-        except KeyboardInterrupt:
-            pass
-
-        # wait for all the scanners to die...
-        for server in self.servers:
-            if server:
-                log.info("waiting for scanner {} to exit...".format(server.pid))
-                server.join()
-
-        log.info("exiting")
-
-    def execute_process_manager(self):
-        for i, p in enumerate(self.servers):
-            if self.servers[i] is not None:
-                if not self.servers[i].is_alive():
-                    log.info("detected dead scanner {}".format(self.servers[i].pid))
-                    self.servers[i].join()
-                    self.servers[i] = None
-
-        for i, scanner in enumerate(self.servers):
-            if scanner is None:
-                logging.info("starting scanner on cpu {}".format(i))
-                self.servers[i] = self.mp_ctx.Process(
-                    target=self.run, name="Yara Scanner Server ({})".format(i), args=(i,)
-                )
-                self.servers[i].start()
-                log.info("started scanner on cpu {} with pid {}".format(i, self.servers[i].pid))
-
-    def initialize_server_socket(self):
-        self.server_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.server_socket.settimeout(1)
-
-        # the path of the unix socket will be socket_dir/cpu_index where cpu_index >= 0
-        self.socket_path = os.path.join(self.base_dir, self.socket_dir, str(self.cpu_index))
-        log.info("initializing server socket on {}".format(self.socket_path))
-
-        if os.path.exists(self.socket_path):
-            try:
-                os.remove(self.socket_path)
-            except Exception as e:
-                log.error("unable to remove {}: {}".format(self.socket_path, e))
-
-        self.server_socket.bind(self.socket_path)
-        self.server_socket.listen(self.backlog)
-
-    def kill_server_socket(self):
-        if self.server_socket is None:
-            return
-
-        try:
-            log.info("closing server socket")
-            self.server_socket.close()
-        except Exception as e:
-            log.error("unable to close server socket: {}".format(e))
-
-        self.server_socket = None
-
-        if os.path.exists(self.socket_path):
-            try:
-                os.remove(self.socket_path)
-            except Exception as e:
-                logging.error("unable to remove {}: {}".format(self.socket_path, e))
-
-    def initialize_scanner(self):
-        log.info("initializing scanner")
-        new_scanner = YaraScanner(
-            signature_dir=self.signature_dir,
-            default_timeout=self.default_timeout,
-            git_repo_dirs=self.git_repo_dirs,
-        )
-        new_scanner.load_rules()
-        self.scanner = new_scanner
-
-    def start(self):
-        self.process_manager = self.mp_ctx.Process(target=self.run_process_manager)
-        self.process_manager.start()
-        log.info("started process manager on pid {}".format(self.process_manager.pid))
-
-    def stop(self):
-        if not self.shutdown.is_set():
-            self.shutdown.set()
-
-        self.wait()
-        # process manager waits for the child processes to exit so we're done at this point
-
-    def wait(self, timeout=None):
-        log.debug("waiting for process manager to exit...")
-        if self.process_manager:
-            self.process_manager.join()
-            self.process_manager = None
-
-    def run(self, cpu_index):
-        self.cpu_index = cpu_index  # starting at 0
-
-        def _handler(signum, frame):
-            self.current_scanner_shutdown.set()
-
-        signal.signal(signal.SIGHUP, _handler)
-        signal.signal(signal.SIGTERM, _handler)
-        signal.signal(signal.SIGINT, _handler)
-
-        self.current_scanner_shutdown = threading.Event()
-
-        try:
-            # load up the yara scanner
-            self.initialize_scanner()
-
-            # watch for the rules to change in another thread
-            self.start_rules_monitor()
-
-            while not self.shutdown.is_set():
-                try:
-                    self.execute()
-
-                    if self.current_scanner_shutdown.is_set():
-                        log.info("got signal to reload rules: exiting...")
-                        break
-
-                except InterruptedError:
-                    pass
-
-                except Exception as e:
-                    log.error("uncaught exception: {} ({})".format(e, type(e)))
-
-        except KeyboardInterrupt:
-            log.info("caught keyboard interrupt - exiting")
-
-        self.stop_rules_monitor()
-        self.kill_server_socket()
-
-    def execute(self):
-        # are we listening on the socket yet?
-        if not self.server_socket:
-            try:
-                self.initialize_server_socket()
-            except Exception as e:
-                self.kill_server_socket()
-                # don't spin the cpu on failing to allocate the socket
-                self.shutdown.wait(timeout=1)
-                return
-
-        # get the next client connection
-        try:
-            log.debug("waiting for client")
-            client_socket, _ = self.server_socket.accept()
-        except socket.timeout as e:
-            # nothing came in while we were waiting (check for shutdown and try again)
-            return
-
-        try:
-            self.process_client(client_socket)
-        except Exception as e:
-            log.info("unable to process client request: {}".format(e))
-        finally:
-            try:
-                client_socket.close()
-            except Exception as e:
-                log.error("unable to close client connection: {}".format(e))
-
-    def process_client(self, client_socket):
-        # read the command byte
-        command = client_socket.recv(1)
-
-        data_or_file = read_data_block(client_socket).decode()
-        ext_vars = read_data_block(client_socket)
-
-        if not ext_vars:
-            ext_vars = {}
-        else:
-            # parse the ext vars json
-            ext_vars = json.loads(ext_vars.decode())
-
-        # extract piggybacked meta_tags from ext_vars
-        meta_tags = ext_vars.pop("__meta_tags", None)
-
-        try:
-            matches = False
-            if command == COMMAND_FILE_PATH:
-                log.info("scanning file {}".format(data_or_file))
-                matches = self.scanner.scan(data_or_file, external_vars=ext_vars, meta_tags=meta_tags)
-            elif command == COMMAND_DATA_STREAM:
-                log.info("scanning {} byte data stream".format(len(data_or_file)))
-                matches = self.scanner.scan_data(data_or_file, external_vars=ext_vars, meta_tags=meta_tags)
-            else:
-                log.error("invalid command {}".format(command))
-                return
-        except Exception as e:
-            log.info("scanning failed: {}".format(e))
-            send_data_block(client_socket, pickle.dumps(e))
-            return
-
-        if not matches:
-            # a data lenghth of 0 means we didn't match anything
-            send_data_block(client_socket, b"")
-        else:
-            # encode and submit the JSON result of the client
-            # print(self.scanner.scan_results)
-            send_data_block(client_socket, pickle.dumps(self.scanner.scan_results))
-
-    def start_rules_monitor(self):
-        """Starts a thread the monitor the yara rules. When it detects the yara rules
-        have changed it creates a new YaraScanner and swaps it in (for self.scanner)."""
-
-        self.rule_monitor_thread = threading.Thread(
-            target=self.rule_monitor_loop, name="Scanner {} Rules Monitor".format(self.cpu_index), daemon=False
-        )
-        self.rule_monitor_thread.start()
-
-    def rule_monitor_loop(self):
-        log.debug("starting rules monitoring")
-        counter = 0
-
-        while True:
-            if self.shutdown.is_set():
-                break
-
-            if self.current_scanner_shutdown.is_set():
-                break
-
-            if counter >= self.update_frequency:
-                log.debug("checking for new rules...")
-
-                # do we need to reload the yara rules?
-                if self.scanner.check_rules():
-                    self.current_scanner_shutdown.set()
-                    break
-
-                counter = 0
-
-            counter += 1
-            self.shutdown.wait(1)
-
-        log.debug("stopped rules monitoring")
-
-    def stop_rules_monitor(self):
-        self.current_scanner_shutdown.set()
-        self.rule_monitor_thread.join(5)
-        if self.rule_monitor_thread.is_alive():
-            log.error("unable to stop rule monitor thread")
-
-
-def _scan(command, data_or_file, ext_vars={}, base_dir=DEFAULT_BASE_DIR, socket_dir=DEFAULT_SOCKET_DIR, meta_tags=None):
-    # pick a random scanner
-    # it doesn't matter which one, as long as the load is evenly distributed
-    starting_index = scanner_index = random.randrange(multiprocessing.cpu_count())
-
-    while True:
-        socket_path = os.path.join(base_dir, socket_dir, str(scanner_index))
-
-        # piggyback meta_tags into ext_vars for the wire protocol
-        if meta_tags:
-            ext_vars = dict(ext_vars)
-            ext_vars["__meta_tags"] = meta_tags
-
-        ext_vars_json = b""
-        if ext_vars:
-            ext_vars_json = json.dumps(ext_vars).encode()
-
-        client_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-
-        try:
-            client_socket.connect(socket_path)
-            client_socket.sendall(command)
-            send_data_block(client_socket, data_or_file.encode())
-            send_data_block(client_socket, ext_vars_json)
-
-            result = read_data_block(client_socket)
-            if result == b"":
-                return {}
-
-            result = pickle.loads(result)
-
-            if isinstance(result, BaseException):
-                raise result
-
-            return result
-
-        except socket.error as e:
-            log.debug("possible restarting scanner: {}".format(e))
-            # in the case where a scanner is restarting (when loading rules)
-            # we will receive a socket error when we try to connect
-            # just move on to the next socket and try again
-            scanner_index += 1
-            if scanner_index >= multiprocessing.cpu_count():
-                scanner_index = 0
-
-            # if we've swung back around wait for a few seconds and try again
-            if scanner_index == starting_index:
-                log.info("no scanners available")
-                raise
-
-            continue
-
-
-def scan_file(path, base_dir=None, socket_dir=DEFAULT_SOCKET_DIR, ext_vars={}, meta_tags=None):
-    return _scan(COMMAND_FILE_PATH, path, ext_vars=ext_vars, base_dir=base_dir, socket_dir=socket_dir, meta_tags=meta_tags)
-
-
-def scan_data(data, base_dir=None, socket_dir=DEFAULT_SOCKET_DIR, ext_vars={}, meta_tags=None):
-    return _scan(COMMAND_DATA_STREAM, data, ext_vars=ext_vars, base_dir=base_dir, socket_dir=socket_dir, meta_tags=meta_tags)
-
-
-#
-# protocol routines
-#
-
-
-def read_n_bytes(s, n):
-    """Reads n bytes from socket s.  Returns the bytearray of the data read."""
-    bytes_read = 0
-    _buffer = []
-    while bytes_read < n:
-        data = s.recv(n - bytes_read)
-        if data == b"":
-            break
-
-        bytes_read += len(data)
-        _buffer.append(data)
-
-    result = b"".join(_buffer)
-    if len(result) != n:
-        log.warning("expected {} bytes but read {}".format(n, len(result)))
-
-    return b"".join(_buffer)
-
-
-def read_data_block_size(s):
-    """Reads the size of the next data block from the given socket."""
-    size = struct.unpack("!I", read_n_bytes(s, 4))
-    size = size[0]
-    log.debug("read command block size {}".format(size))
-    return size
-
-
-def read_data_block(s):
-    """Reads the next data block from socket s. Returns the bytearray of the data portion of the block."""
-    # read the size of the data block (4 byte network order integer)
-    size = struct.unpack("!I", read_n_bytes(s, 4))
-    size = size[0]
-    # log.debug("read command block size {}".format(size))
-    # read the data portion of the data block
-    return read_n_bytes(s, size)
-
-
-def iterate_data_blocks(s):
-    """Reads the next data block until a block0 is read."""
-    while True:
-        block = read_data_block(s)
-        if len(block) == 0:
-            raise StopIteration()
-
-        yield block
-
-
-def send_data_block(s, data):
-    """Writes the given data to the given socket as a data block."""
-    message = b"".join([struct.pack("!I", len(data)), data])
-    # log.debug("sending data block length {} ({})".format(len(message), message[:64]))
-    s.sendall(message)
-
-
-def send_block0(s):
-    """Writes an empty data block to the given socket."""
-    send_data_block(s, b"")
 
 
 class TestConfig:
