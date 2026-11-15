@@ -30,6 +30,14 @@ if scanner.check_rules():
    scanner.load_rules()
 ```
 
+What the rules were compiled from is kept on the scanner after `load_rules()`: `scanner.compiled_sources` has one `CompiledSource` per rule file (its namespace, the text that was compiled, the includes it pulled in and their text, its compile error and its rule names) and `scanner.compile_error` says why the files could not be compiled together.
+
+```python
+scanner.load_rules()
+for compiled in scanner.compiled_sources:
+    print(compiled.path, compiled.namespace, compiled.error, compiled.rules)
+```
+
 ## Installation Instructions
 
 ### From Github

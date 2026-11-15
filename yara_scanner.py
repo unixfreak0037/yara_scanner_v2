@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # vim: sw=4:ts=4:et:cc=120
-__version__ = "3.0.0"
+__version__ = "3.1.0"
 __doc__ = """
 Yara Scanner v2
 ============
@@ -45,6 +45,7 @@ import shutil
 import sys
 import time
 
+from dataclasses import dataclass, field
 from operator import itemgetter
 import hashlib
 import tempfile
@@ -54,6 +55,39 @@ from typing import Dict, List, Optional
 import plyara, plyara.utils
 import progress.bar
 import yara
+
+
+@dataclass
+class IncludedSource:
+    """A file an include statement pulled in while a rule file compiled."""
+
+    #: the file name as the include statement gives it
+    name: str
+    #: the path it resolved to
+    path: str
+    #: the text compiled in place of the include statement ("" when the file could not be read)
+    source: str
+    #: why the file could not be read, or None
+    error: Optional[str] = None
+
+
+@dataclass
+class CompiledSource:
+    """A rule file YaraScanner.compile_and_load_rules read, and what compiling it on its own gave."""
+
+    path: str
+    #: the namespace its rules are loaded into
+    namespace: str
+    #: the text read from path, which is what was compiled
+    source: str
+    #: every include compiling it pulled in, nested ones too, in the order yara asked for them
+    includes: List[IncludedSource] = field(default_factory=list)
+    #: why it did not compile on its own, or None. A file with an error is left out of the rules
+    error: Optional[str] = None
+    #: the compiler's warnings
+    warnings: List[str] = field(default_factory=list)
+    #: the identifiers of the rules it defines, those of its includes too
+    rules: List[str] = field(default_factory=list)
 
 
 class RulesNotLoadedError(Exception):
@@ -177,6 +211,11 @@ class YaraScanner(object):
         """
         self.rules = None
         self._scan_results = []
+
+        # what the last compile_and_load_rules() compiled; empty when the rules came from a compiled file
+        self.compiled_sources: List[CompiledSource] = []
+        # why the last compile_and_load_rules() could not compile the files together, or None
+        self.compile_error: Optional[str] = None
 
         # we can pass in a list of "blacklisted" rules
         # this is a list of rule NAMES that are essentially ignored in the scan results (not output)
@@ -782,6 +821,8 @@ class YaraScanner(object):
             if os.path.isfile(path):
                 log.debug(f"up to date compiled rules already exist at {path}")
                 self.rules = yara.load(path)
+                self.compiled_sources = []
+                self.compile_error = None
                 return True
         except:
             log.warning(f"failed to load compiled rules: {path}")
@@ -802,17 +843,29 @@ class YaraScanner(object):
         """
         Loads and compiles all tracked yara rules. Returns True if the rules were loaded correctly, False otherwise.
 
+        Each file is compiled on its own first, and a file that fails is left out. The files that
+        compile are then compiled together, one source per namespace, into the rules scans use.
+        What was compiled is kept in :attr:`compiled_sources` (one :class:`CompiledSource` per file
+        read, in the order read) and the error of the combined compile in :attr:`compile_error`.
+
         Scans can be performed only after the rules are loaded.
 
         :rtype: bool"""
 
-        # as we interate over the files to make sure they compile, we need to
-        # keep track of the current file path
-        current_file_path = None
+        self.compiled_sources = []
+        self.compile_error = None
 
-        def include_callback(requested_filename: str, filename: Optional[str], namespace: str) -> str:
-            nonlocal current_file_path
+        # the file being compiled on its own, which the callback resolves includes against and
+        # records them on; None while the files are compiled together
+        current: Optional[CompiledSource] = None
 
+        # (namespace, filename, requested_filename) -> the IncludedSource read for it. Both passes
+        # call the callback with the same filename and requested_filename for an include, so the
+        # combined compile gets the text the file compiled with on its own, not a second read of a
+        # file that may have changed since (or that its namespace resolves to another path)
+        includes: Dict[tuple, IncludedSource] = {}
+
+        def read_include(requested_filename: str, filename: Optional[str], namespace: str) -> IncludedSource:
             # if namespace is not "default" then its set to the directory of the current file
             if namespace != "default":
                 dir_name = namespace
@@ -821,18 +874,35 @@ class YaraScanner(object):
                 if filename is not None:
                     dir_name = os.path.dirname(filename)
                 else:
-                    # otherwise we use the non local variable that gets set outside of this function
-                    dir_name = os.path.dirname(current_file_path)
+                    dir_name = os.path.dirname(current.path)
 
             # build the path to the requested file that is relative to dir_name
             relative_path = os.path.join(dir_name, requested_filename)
 
             try:
                 with open(relative_path, "r") as fp:
-                    return fp.read()
+                    return IncludedSource(requested_filename, relative_path, fp.read())
             except Exception as e:
                 log.error("unable to include file %s: %s", relative_path, e)
-                return ""
+                return IncludedSource(requested_filename, relative_path, "", str(e))
+
+        def include_callback(requested_filename: str, filename: Optional[str], namespace: str) -> str:
+            if current is not None:
+                key = (current.namespace, filename, requested_filename)
+                if key not in includes:
+                    includes[key] = read_include(requested_filename, filename, namespace)
+
+                current.includes.append(includes[key])
+                return includes[key].source
+
+            key = (namespace, filename, requested_filename)
+            if key in includes:
+                return includes[key].source
+
+            # every file in the combined compile made its include calls when it compiled on its own
+            log.warning("include %s from namespace %s was not read when its file compiled on its own",
+                        requested_filename, namespace)
+            return read_include(requested_filename, filename, namespace).source
 
         if self.tracked_compiled_path:
             try:
@@ -870,32 +940,36 @@ class YaraScanner(object):
                     log.debug("file %s does not exist", file_path)
                     continue
 
-                # this tells the callback function where to look for files
-                current_file_path = file_path
-
                 with open(file_path, "r") as fp:
                     log.debug("loading namespace {} rule file {}".format(namespace, file_path))
                     data = fp.read()
 
-                    try:
-                        # compile each file individually first, make sure that works
-                        rule_context = yara.compile(source=data, externals=external_vars, include_callback=include_callback)
-                        rule_count += 1
-                    except Exception as e:
-                        log.error("unable to compile {}: {}".format(file_path, str(e)))
-                        compilation_errors = True
-                        continue
+                current = CompiledSource(file_path, namespace, data)
+                self.compiled_sources.append(current)
 
-                    # then we just store the source to be loaded all at once in the compilation that gets used
-                    if namespace not in sources:
-                        sources[namespace] = []
+                try:
+                    # compile each file individually first, make sure that works
+                    rule_context = yara.compile(source=data, externals=external_vars, include_callback=include_callback)
+                    rule_count += 1
+                except Exception as e:
+                    log.error("unable to compile {}: {}".format(file_path, str(e)))
+                    current.error = str(e)
+                    compilation_errors = True
+                    continue
 
-                    sources[namespace].append(data)
+                current.warnings = list(rule_context.warnings or [])
+                current.rules = [rule.identifier for rule in rule_context]
+
+                # then we just store the source to be loaded all at once in the compilation that gets used
+                if namespace not in sources:
+                    sources[namespace] = []
+
+                sources[namespace].append(data)
 
         for namespace in sources.keys():
             sources[namespace] = "\r\n".join(sources[namespace])
 
-        current_file_path = None
+        current = None
 
         try:
             log.info("loading {} rules".format(rule_count))
@@ -903,6 +977,7 @@ class YaraScanner(object):
             return not compilation_errors
         except Exception as e:
             log.error(f"unable to compile all yara rules combined: {e}")
+            self.compile_error = str(e)
             self.rules = None
 
         return False

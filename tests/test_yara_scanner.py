@@ -6,12 +6,15 @@ import time
 from subprocess import Popen
 
 import pytest
+import yara
+
+import yara_scanner
 
 from yara_scanner import (ALL_RESULT_KEYS, RESULT_KEY_COMMIT, RESULT_KEY_META,
                           RESULT_KEY_NAMESPACE, RESULT_KEY_RULE,
                           RESULT_KEY_STRINGS, RESULT_KEY_TAGS,
                           RESULT_KEY_TARGET, YaraScanner, __version__, RulesNotLoadedError,
-                          get_current_repo_commit)
+                          get_current_repo_commit, CompiledSource, IncludedSource)
 
 def create_file(path, content):
     dir = os.path.dirname(path)
@@ -1028,3 +1031,165 @@ def test_scan_does_not_modify_external_vars(tmp_path):
     assert scanner.scan(scan_target_path, external_vars=external_vars, meta_tags=["email_attachment"])
     assert scanner.scan_data('Sample content.', external_vars=external_vars, meta_tags=["email_attachment"])
     assert external_vars == {"filetype": "text"}
+
+@pytest.mark.integration
+def test_compiled_sources(tmp_path, caplog):
+    """Each file read is recorded with its namespace, its text, its rules and its warnings, and a
+    file that does not compile with its error."""
+    rules_dir = tmp_path / 'rules'
+    good = create_file(str(rules_dir / 'good.yar'), 'rule good { strings: $a = { 00 } condition: $a }')
+    bad = create_file(str(rules_dir / 'bad.yar'), 'rule bad { condition: nope }')
+    scanner = YaraScanner()
+    scanner.track_yara_dir(str(rules_dir))
+
+    assert not scanner.load_rules()
+
+    records = {record.path: record for record in scanner.compiled_sources}
+    assert set(records) == {good, bad}
+    assert records[good] == CompiledSource(
+        good, str(rules_dir), 'rule good { strings: $a = { 00 } condition: $a }',
+        warnings=['line 1: string "$a" may slow down scanning'], rules=['good'])
+    assert records[bad].namespace == str(rules_dir)
+    assert records[bad].source == 'rule bad { condition: nope }'
+    assert 'undefined identifier "nope"' in records[bad].error
+    assert records[bad].rules == []
+    assert scanner.compile_error is None
+    # the file that did not compile is left out of the rules
+    assert [rule.identifier for rule in scanner.rules] == ['good']
+
+@pytest.mark.integration
+def test_compiled_sources_includes(tmp_path):
+    """Includes are recorded on the file that pulled them in, with the text compiled in their place."""
+    rules_dir = tmp_path / 'rules'
+    top = create_file(str(rules_dir / 'top.yar'),
+                      'include "inc/inner.yara.inc"\ninclude "leaf.yara.inc"\nrule top { condition: inner and leaf }')
+    create_file(str(rules_dir / 'inc' / 'inner.yara.inc'), 'rule inner { condition: true }')
+    create_file(str(rules_dir / 'leaf.yara.inc'), 'rule leaf { condition: true }')
+    scanner = YaraScanner()
+    scanner.track_yara_dir(str(rules_dir))
+
+    assert scanner.load_rules()
+
+    (record,) = scanner.compiled_sources
+    assert record.path == top
+    assert record.includes == [
+        IncludedSource('inc/inner.yara.inc', str(rules_dir / 'inc' / 'inner.yara.inc'), 'rule inner { condition: true }'),
+        IncludedSource('leaf.yara.inc', str(rules_dir / 'leaf.yara.inc'), 'rule leaf { condition: true }'),
+    ]
+    assert sorted(record.rules) == ['inner', 'leaf', 'top']
+    assert scanner.scan_data('x')
+    assert {result['rule'] for result in scanner.scan_results} == {'inner', 'leaf', 'top'}
+
+@pytest.mark.integration
+def test_compiled_sources_include_not_readable(tmp_path, caplog):
+    rules_dir = tmp_path / 'rules'
+    create_file(str(rules_dir / 'top.yar'), 'include "missing.yara.inc"\nrule top { condition: true }')
+    scanner = YaraScanner()
+    scanner.track_yara_dir(str(rules_dir))
+
+    assert scanner.load_rules()
+
+    (include,) = scanner.compiled_sources[0].includes
+    assert include.name == 'missing.yara.inc'
+    assert include.path == str(rules_dir / 'missing.yara.inc')
+    assert include.source == ''
+    assert 'No such file or directory' in include.error
+    assert any(record.levelno == logging.ERROR and 'unable to include file' in record.getMessage()
+               for record in caplog.records)
+
+@pytest.mark.integration
+def test_compiled_sources_include_changed_while_compiling(tmp_path, monkeypatch):
+    """The rules are compiled from the include text that was recorded, even when the file changes
+    between compiling each file on its own and compiling them together."""
+    rules_dir = tmp_path / 'rules'
+    create_file(str(rules_dir / 'top.yar'), 'include "inc.yara.inc"\nrule top { condition: true }')
+    include_path = create_file(str(rules_dir / 'inc.yara.inc'), 'rule before { condition: true }')
+    real_compile = yara.compile
+
+    def compile(*args, **kwargs):
+        if 'sources' in kwargs:
+            create_file(include_path, 'rule after { condition: true }')
+        return real_compile(*args, **kwargs)
+
+    monkeypatch.setattr(yara, 'compile', compile)
+    scanner = YaraScanner()
+    scanner.track_yara_dir(str(rules_dir))
+
+    assert scanner.load_rules()
+
+    assert scanner.compiled_sources[0].includes[0].source == 'rule before { condition: true }'
+    assert sorted(rule.identifier for rule in scanner.rules) == ['before', 'top']
+
+@pytest.mark.integration
+def test_compiled_sources_include_from_tracked_file(tmp_path):
+    """A tracked file's namespace is its own path, which the combined compile used to resolve its
+    includes against; it now gets the include its file compiled with on its own."""
+    rule_path = create_file(str(tmp_path / 'top.yar'), 'include "inc.yara.inc"\nrule top { condition: inc }')
+    create_file(str(tmp_path / 'inc.yara.inc'), 'rule inc { condition: true }')
+    scanner = YaraScanner()
+    scanner.track_yara_file(rule_path)
+
+    assert scanner.load_rules()
+
+    assert scanner.compile_error is None
+    assert sorted(rule.identifier for rule in scanner.rules) == ['inc', 'top']
+
+@pytest.mark.integration
+def test_compiled_sources_include_not_read_alone(tmp_path, monkeypatch, caplog):
+    """An include the combined compile asks for that no file asked for on its own is read then, and
+    logged."""
+    rules_dir = tmp_path / 'rules'
+    create_file(str(rules_dir / 'top.yar'), 'rule top { condition: true }')
+    create_file(str(rules_dir / 'extra.yara.inc'), 'rule extra { condition: true }')
+    real_compile = yara.compile
+
+    def compile(*args, **kwargs):
+        if 'sources' in kwargs:
+            kwargs['sources'] = {ns: source + '\ninclude "extra.yara.inc"' for ns, source in kwargs['sources'].items()}
+        return real_compile(*args, **kwargs)
+
+    monkeypatch.setattr(yara, 'compile', compile)
+    scanner = YaraScanner()
+    scanner.track_yara_dir(str(rules_dir))
+
+    assert scanner.load_rules()
+
+    assert sorted(rule.identifier for rule in scanner.rules) == ['extra', 'top']
+    assert any(record.levelno == logging.WARNING and 'was not read when its file compiled on its own' in record.getMessage()
+               for record in caplog.records)
+
+@pytest.mark.integration
+def test_compile_error(tmp_path, caplog):
+    """Files that compile on their own but not together: the error is kept, and so is the record."""
+    rules_dir = tmp_path / 'rules'
+    create_file(str(rules_dir / 'a.yar'), 'rule same { condition: true }')
+    create_file(str(rules_dir / 'b.yar'), 'rule same { condition: false }')
+    scanner = YaraScanner()
+    scanner.track_yara_dir(str(rules_dir))
+
+    assert not scanner.load_rules()
+
+    assert scanner.rules is None
+    assert 'duplicated identifier "same"' in scanner.compile_error
+    assert sorted(os.path.basename(record.path) for record in scanner.compiled_sources) == ['a.yar', 'b.yar']
+    assert all(record.error is None for record in scanner.compiled_sources)
+
+    # a later load that succeeds clears both
+    create_file(str(rules_dir / 'b.yar'), 'rule other { condition: false }')
+    assert scanner.load_rules()
+    assert scanner.compile_error is None
+    assert sorted(record.rules[0] for record in scanner.compiled_sources) == ['other', 'same']
+
+@pytest.mark.integration
+def test_compiled_sources_cleared_by_compiled_rules(tmp_path):
+    """Rules loaded from a compiled file come with no sources."""
+    rules_dir = tmp_path / 'rules'
+    create_file(str(rules_dir / 'a.yar'), 'rule a { condition: true }')
+    scanner = YaraScanner(auto_compile_rules=True, auto_compiled_rules_dir=str(tmp_path))
+    scanner.track_yara_dir(str(rules_dir))
+    assert scanner.load_rules()
+    assert len(scanner.compiled_sources) == 1
+
+    # the second load finds the rules the first one saved
+    assert scanner.load_rules()
+    assert scanner.compiled_sources == []
