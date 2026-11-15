@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # vim: sw=4:ts=4:et:cc=120
-__version__ = "3.1.0"
+__version__ = "3.2.0"
 __doc__ = """
 Yara Scanner v2
 ============
@@ -42,6 +42,7 @@ import os
 import os.path
 import re
 import shutil
+import stat
 import sys
 import time
 
@@ -96,6 +97,62 @@ class RulesNotLoadedError(Exception):
     pass
 
 
+class IncludeRefusedError(Exception):
+    """Raised for a file the include boundary does not let the compile read. Its message is the
+    error recorded for the file; it never depends on anything outside the boundary."""
+    pass
+
+
+def _is_inside(path: str, root: str) -> bool:
+    """True when path is below root. Both are absolute and normalized; nothing is opened."""
+    return path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def open_include(dir_name: str, requested_filename: str, boundary: str):
+    """Opens the file an include statement in a file of dir_name names, when it is a regular file
+    inside the directory boundary that is reached through no symbolic link. Anything else raises
+    :class:`IncludeRefusedError`, before it is opened.
+
+    An absolute name and a name that leaves the boundary are refused from the text of the path
+    alone, so the refusal is the same whether or not the file exists. The filesystem is looked at
+    only below the boundary, one path component at a time, and a symbolic link is refused where it
+    is found, without looking at what it points to. The path opened is the normalized one that was
+    checked. A file missing inside the boundary raises FileNotFoundError, as it always has."""
+    if os.path.isabs(requested_filename):
+        raise IncludeRefusedError("include refused: an absolute path is not allowed")
+
+    root = os.path.abspath(boundary)
+    target = os.path.normpath(os.path.join(os.path.abspath(dir_name), requested_filename))
+    if target == root:
+        raise IncludeRefusedError("include refused: not a regular file")
+
+    if not _is_inside(target, root):
+        raise IncludeRefusedError("include refused: the path leaves the include boundary")
+
+    current = root
+    for part in os.path.relpath(target, root).split(os.sep):
+        current = os.path.join(current, part)
+        mode = os.lstat(current).st_mode
+        if stat.S_ISLNK(mode):
+            raise IncludeRefusedError("include refused: the path goes through a symbolic link")
+
+    if not stat.S_ISREG(mode):
+        raise IncludeRefusedError("include refused: not a regular file")
+
+    return open(target, "r")
+
+
+def rule_file_refusal(file_path: str, boundary: str) -> Optional[str]:
+    """Returns why a rule file found by listing a directory is not read, or None when it can be.
+    The file can be a symbolic link, or be reached through one, as long as what it resolves to is
+    inside the directory boundary. Whether the target of a link out of the boundary exists makes no
+    difference to the answer."""
+    if _is_inside(os.path.realpath(file_path), os.path.realpath(boundary)):
+        return None
+
+    return "rule file refused: it resolves to a path outside the include boundary"
+
+
 # keys to the JSON dicts you get back from YaraScanner.scan_results
 RESULT_KEY_TARGET = "target"
 RESULT_KEY_META = "meta"
@@ -143,6 +200,14 @@ def get_current_repo_commit(repo_dir):
     return commit[0:40]
 
 
+def _getmtime(path):
+    """The modification time of a file, or None for one that is not there (a link to nothing.)"""
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+
 def get_rules_md5(namespaces: Dict[str, List[str]]) -> str:
     """Combine all of the rule files and hash. We can then store the compiled
     rules to disk and reload on a later run if nothing has changed"""
@@ -181,6 +246,7 @@ class YaraScanner(object):
         auto_compiled_rules_dir=None,
         default_timeout=5,
         git_repo_dirs=None,
+        allow_includes_outside=False,
     ):
         """
         Creates a new YaraScanner object.
@@ -205,8 +271,21 @@ class YaraScanner(object):
         :para compiled_rules_dir: A path to a directory to read/write compiled rules.
         If this is left as None then the system temporary directory is used.
 
+        :param allow_includes_outside: By default an include statement can
+        only read a regular file inside the *include boundary* of the rule file
+        it is in, reached through no symbolic link, and a rule file found by
+        listing a directory is read only if it resolves to a path inside that
+        boundary. The boundary is the tracked directory, the directory of a
+        file tracked on its own, or signature_dir for the directories found in
+        it; the track functions take an include_boundary to use another. Set
+        this to True to read whatever an include names and whatever a rule
+        file links to, as versions before 3.2.0 did. Only do that when
+        everyone who can write a rule is trusted with every file the process
+        can read.
+
         :type signature_dir: str or None
         :type git_repo_dirs: list[str] or None
+        :type allow_includes_outside: bool
 
 
         """
@@ -228,6 +307,12 @@ class YaraScanner(object):
         self.tracked_repos = {}  # key = dir_path, value = current git commit
         self.tracked_compiled_path = None
         self.tracked_compiled_lastmtime = None
+
+        # an include may only read inside the boundary of the namespace its rule file is in
+        self.allow_includes_outside = allow_includes_outside
+        # key = namespace (the tracked file_path or dir_path), value = the directory its includes
+        # must stay inside. A namespace with no entry is bounded by its own directory.
+        self.include_boundaries = {}
 
         # both parameters to this function are for backwards compatibility
         if thread_count is not None:
@@ -256,9 +341,10 @@ class YaraScanner(object):
                 resolved_path = os.path.realpath(dir_path)
                 if resolved_path in git_repo_paths:
                     tracked_repo_paths.add(resolved_path)
-                    self.track_yara_repository(dir_path)
+                    self.track_yara_repository(dir_path, include_boundary=signature_dir)
                 else:
-                    self.track_yara_dir(dir_path)
+                    # a rule set can include a file of the set next to it
+                    self.track_yara_dir(dir_path, include_boundary=signature_dir)
 
             for missing_path in git_repo_paths - tracked_repo_paths:
                 log.error("{} is not a directory in signature directory {}".format(missing_path, signature_dir))
@@ -348,8 +434,37 @@ class YaraScanner(object):
         if os.path.exists(file_path):
             self.tracked_compiled_lastmtime = os.path.getmtime(file_path)
 
-    def track_yara_file(self, file_path):
-        """Adds a single yara file.  The file is then monitored for changes to mtime, removal or adding."""
+    def get_include_boundary(self, namespace):
+        """Returns the directory the includes of the rule files in the given namespace must stay
+        inside: the one it was tracked with, or else the tracked directory itself (the directory of
+        a file tracked on its own.)"""
+        boundary = self.include_boundaries.get(namespace)
+        if boundary is not None:
+            return boundary
+
+        if namespace in self.tracked_files:
+            return os.path.dirname(namespace) or os.curdir
+
+        return namespace
+
+    def _rule_file_mtime(self, dir_path, file_path):
+        """The modification time a file of a tracked directory is tracked by. A link out of the
+        boundary is not read, so it is tracked by the link itself and not by what it points to."""
+        if not self.allow_includes_outside and rule_file_refusal(file_path, self.get_include_boundary(dir_path)):
+            try:
+                return os.lstat(file_path).st_mtime
+            except OSError:
+                return None
+
+        return _getmtime(file_path)
+
+    def track_yara_file(self, file_path, include_boundary=None):
+        """Adds a single yara file.  The file is then monitored for changes to mtime, removal or adding.
+
+        Its includes must stay inside include_boundary, which defaults to the directory the file is in."""
+        if include_boundary is not None:
+            self.include_boundaries[file_path] = include_boundary
+
         if not os.path.exists(file_path):
             self.tracked_files[file_path] = None  # file did not exist when we started tracking
             # we keep track of the path by keeping the key in the dictionary
@@ -359,32 +474,42 @@ class YaraScanner(object):
 
         log.debug("yara file {} tracked @ {}".format(file_path, self.tracked_files[file_path]))
 
-    def track_yara_dir(self, dir_path):
-        """Adds all files in a given directory that end with .yar when converted to lowercase.  All files are monitored for changes to mtime, as well as new and removed files."""
+    def track_yara_dir(self, dir_path, include_boundary=None):
+        """Adds all files in a given directory that end with .yar when converted to lowercase.  All files are monitored for changes to mtime, as well as new and removed files.
+
+        The includes of these files must stay inside include_boundary, which defaults to dir_path.
+        Pass a directory above dir_path to let them reach files next to it."""
         if not os.path.isdir(dir_path):
             log.error("{} is not a directory".format(dir_path))
             return
+
+        if include_boundary is not None:
+            self.include_boundaries[dir_path] = include_boundary
 
         self.tracked_dirs[dir_path] = {}
 
         for file_path in os.listdir(dir_path):
             file_path = os.path.join(dir_path, file_path)
             if file_path.lower().endswith(".yar") or file_path.lower().endswith(".yara"):
-                self.tracked_dirs[dir_path][file_path] = os.path.getmtime(file_path)
+                self.tracked_dirs[dir_path][file_path] = self._rule_file_mtime(dir_path, file_path)
                 log.debug("tracking file {} @ {}".format(file_path, self.tracked_dirs[dir_path][file_path]))
 
         log.debug("tracking directory {} with {} yara files".format(dir_path, len(self.tracked_dirs[dir_path])))
 
-    def track_yara_repository(self, dir_path):
+    def track_yara_repository(self, dir_path, include_boundary=None):
         """Adds all files in a given directory **that is part of a git repository** that end with .yar when converted to lowercase.  Only commits to the repository trigger rule reload.
 
         The directory does not have to be the root of the repository. Any
         directory inside of one works, in which case the commit that is tracked
         (and reported with matching rules) is the current commit of the
-        repository the directory belongs to."""
+        repository the directory belongs to.
+
+        The includes of these files must stay inside include_boundary, which
+        defaults to dir_path (not the root of the repository.) Pass the root of
+        the repository to let them reach the rest of it."""
         if not self.git_available():
             log.warning("git cannot be found: defaulting to track_yara_dir")
-            return self.track_yara_dir(dir_path)
+            return self.track_yara_dir(dir_path, include_boundary=include_boundary)
 
         if not os.path.isdir(dir_path):
             log.error("{} is not a directory".format(dir_path))
@@ -397,6 +522,9 @@ class YaraScanner(object):
         if current_commit is None:
             log.error("{} is not part of a git repository".format(dir_path))
             return False
+
+        if include_boundary is not None:
+            self.include_boundaries[dir_path] = include_boundary
 
         self.tracked_repos[dir_path] = current_commit
         log.debug("tracking git repo {} @ {}".format(dir_path, self.tracked_repos[dir_path]))
@@ -476,7 +604,7 @@ class YaraScanner(object):
                     reload_dir = True
                     reload_rules = True
 
-                elif os.path.getmtime(file_path) != self.tracked_dirs[dir_path][file_path]:
+                elif self._rule_file_mtime(dir_path, file_path) != self.tracked_dirs[dir_path][file_path]:
                     log.info("detected change in yara file {} dir {}".format(file_path, dir_path))
                     reload_dir = True
                     reload_rules = True
@@ -805,8 +933,23 @@ class YaraScanner(object):
 
     def load_rules(self, external_vars=DEFAULT_YARA_EXTERNALS):
         if self.auto_compile_rules:
-            rules_hash = get_rules_md5(self.get_namespace_dict())
-            compiled_rules_path = os.path.join(self.auto_compiled_rules_dir, f"{rules_hash}.cyar")
+            namespaces = self.get_namespace_dict()
+            suffix = ".cyar"
+            if not self.allow_includes_outside:
+                # a rule file that is not read is not hashed either, and rules that were compiled
+                # with includes read from anywhere are not the rules of a load that is bounded
+                suffix = ".bounded.cyar"
+                namespaces = {
+                    namespace: [
+                        _ for _ in file_paths
+                        if namespace in self.tracked_files
+                        or rule_file_refusal(_, self.get_include_boundary(namespace)) is None
+                    ]
+                    for namespace, file_paths in namespaces.items()
+                }
+
+            rules_hash = get_rules_md5(namespaces)
+            compiled_rules_path = os.path.join(self.auto_compiled_rules_dir, f"{rules_hash}{suffix}")
             if self.load_compiled_rules(compiled_rules_path):
                 return True
 
@@ -883,7 +1026,14 @@ class YaraScanner(object):
             relative_path = os.path.join(dir_name, requested_filename)
 
             try:
-                with open(relative_path, "r") as fp:
+                if self.allow_includes_outside:
+                    fp = open(relative_path, "r")
+                else:
+                    # refused before it is opened unless it is a regular file inside the boundary
+                    boundary = self.get_include_boundary(namespace if current is None else current.namespace)
+                    fp = open_include(dir_name, requested_filename, boundary)
+
+                with fp:
                     return IncludedSource(requested_filename, relative_path, fp.read())
             except Exception as e:
                 log.error("unable to include file %s: %s", relative_path, e)
@@ -941,13 +1091,20 @@ class YaraScanner(object):
 
                 log.debug("loading namespace {} rule file {}".format(namespace, file_path))
                 try:
+                    # a file the caller tracked by name is read whatever it is; one found by listing
+                    # a directory must not be a link out of the boundary
+                    if not self.allow_includes_outside and namespace not in self.tracked_files:
+                        refusal = rule_file_refusal(file_path, self.get_include_boundary(namespace))
+                        if refusal is not None:
+                            raise IncludeRefusedError(refusal)
+
                     with open(file_path, "r") as fp:
                         data = fp.read()
                 except FileNotFoundError:
                     # a tracked file that was removed, perhaps since it was listed
                     log.debug("file %s does not exist", file_path)
                     continue
-                except (OSError, UnicodeDecodeError) as e:
+                except (OSError, UnicodeDecodeError, IncludeRefusedError) as e:
                     # like a file that does not compile, it is left out and the rest are loaded
                     log.error("unable to read {}: {}".format(file_path, e))
                     self.compiled_sources.append(CompiledSource(file_path, namespace, "", error=str(e)))
@@ -1501,6 +1658,16 @@ def main():
         these.""",
     )
 
+    parser.add_argument(
+        "--allow-includes-outside",
+        default=False,
+        action="store_true",
+        help="""Let an include statement read any file, and a rule file be a
+        link to any file. By default an include must be a regular file inside
+        the directory its rules were loaded from (the signature directory for
+        the directories in it), reached through no symbolic link.""",
+    )
+
     args = parser.parse_args()
 
     if (
@@ -1525,6 +1692,7 @@ def main():
         auto_compile_rules=args.auto_compile_rules,
         auto_compiled_rules_dir=args.auto_compiled_rules_dir,
         git_repo_dirs=args.git_repo_dirs,
+        allow_includes_outside=args.allow_includes_outside,
     )
     scanner.blacklist = args.blacklisted_rules
 

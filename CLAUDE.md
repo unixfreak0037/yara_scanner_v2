@@ -48,6 +48,10 @@ The codebase is a single flat Python module (no package directory):
 
 `compile_and_load_rules()` compiles each file on its own, drops those it cannot read or that do not compile, then compiles the rest together (one source per namespace). An include, nested or not, is relative to the file that has the include statement. It keeps a record of it: `scanner.compiled_sources` holds one `CompiledSource` per file read (path, namespace, the text read, its `IncludedSource`s, its compile error and warnings, its rule identifiers) and `scanner.compile_error` the combined compile's error. An include is read once per load and the combined compile is given that same text, so the record is exactly what the loaded rules came from. Rules loaded from a compiled file leave the record empty.
 
+### Include Boundary
+
+An include is read by `open_include()`: only a regular file inside the namespace's boundary, through no symbolic link, and refused (`IncludeRefusedError`, recorded as the `IncludedSource`'s error) before anything is opened otherwise. Absolute paths and paths that leave the boundary are refused by path arithmetic alone, so the refusal does not depend on the file existing. `scanner.include_boundaries` maps a namespace to its boundary (`get_include_boundary()` falls back to the tracked directory, or a tracked file's directory); the constructor uses `signature_dir` for the directories it finds. A rule file found by listing a directory is refused when it resolves outside the boundary (`rule_file_refusal()`). `allow_includes_outside=True` turns all of it off.
+
 ### Rule Change Detection
 
 Three tracking strategies with unified interface: single files (mtime-based), directories (tracks .yar/.yara additions/changes/deletions), git repos (triggers only on new commits). `rules_changed()` reports (and re-tracks) source changes only; `check_rules()` additionally returns True while no rules are loaded, so a watcher that never compiles must use `rules_changed()`.
