@@ -855,28 +855,30 @@ class YaraScanner(object):
         self.compiled_sources = []
         self.compile_error = None
 
-        # the file being compiled on its own, which the callback resolves includes against and
-        # records them on; None while the files are compiled together
+        # the file being compiled on its own, which its top-level includes resolve against and which
+        # records them; None while the files are compiled together
         current: Optional[CompiledSource] = None
 
-        # (namespace, filename, requested_filename) -> the IncludedSource read for it. Both passes
-        # call the callback with the same filename and requested_filename for an include, so the
-        # combined compile gets the text the file compiled with on its own, not a second read of a
-        # file that may have changed since (or that its namespace resolves to another path)
+        # requested name -> the path it resolved to, in the compile in progress. yara gives the
+        # callback of a nested include the name its parent was requested by, not the parent's path.
+        # When two includes requested by the same name resolve to different paths, the later wins.
+        parents: Dict[str, str] = {}
+
+        # (namespace, the parent's resolved path or None, requested name) -> the IncludedSource read
+        # for it. Both passes make the same calls for an include, so the combined compile gets the
+        # text the file compiled with on its own, not a second read of a file that may have changed
         includes: Dict[tuple, IncludedSource] = {}
 
-        def read_include(requested_filename: str, filename: Optional[str], namespace: str) -> IncludedSource:
-            # if namespace is not "default" then its set to the directory of the current file
-            if namespace != "default":
-                dir_name = namespace
+        def read_include(requested_filename: str, parent: Optional[str], namespace: str) -> IncludedSource:
+            # an include is relative to the file that has the include statement
+            if parent is not None:
+                dir_name = os.path.dirname(parent)
+            elif current is not None:
+                dir_name = os.path.dirname(current.path)
             else:
-                # otherwise we use the directory of the current file
-                if filename is not None:
-                    dir_name = os.path.dirname(filename)
-                else:
-                    dir_name = os.path.dirname(current.path)
+                # the combined compile names each namespace after its directory
+                dir_name = namespace
 
-            # build the path to the requested file that is relative to dir_name
             relative_path = os.path.join(dir_name, requested_filename)
 
             try:
@@ -887,22 +889,22 @@ class YaraScanner(object):
                 return IncludedSource(requested_filename, relative_path, "", str(e))
 
         def include_callback(requested_filename: str, filename: Optional[str], namespace: str) -> str:
+            parent = None if filename is None else parents.get(filename)
+            key = (namespace if current is None else current.namespace, parent, requested_filename)
+            if key not in includes:
+                if current is None:
+                    # every file in the combined compile made its include calls when it compiled on its own
+                    log.warning("include %s from namespace %s was not read when its file compiled on its own",
+                                requested_filename, namespace)
+
+                includes[key] = read_include(requested_filename, parent, namespace)
+
+            included = includes[key]
+            parents[requested_filename] = included.path
             if current is not None:
-                key = (current.namespace, filename, requested_filename)
-                if key not in includes:
-                    includes[key] = read_include(requested_filename, filename, namespace)
+                current.includes.append(included)
 
-                current.includes.append(includes[key])
-                return includes[key].source
-
-            key = (namespace, filename, requested_filename)
-            if key in includes:
-                return includes[key].source
-
-            # every file in the combined compile made its include calls when it compiled on its own
-            log.warning("include %s from namespace %s was not read when its file compiled on its own",
-                        requested_filename, namespace)
-            return read_include(requested_filename, filename, namespace).source
+            return included.source
 
         if self.tracked_compiled_path:
             try:
@@ -946,6 +948,7 @@ class YaraScanner(object):
 
                 current = CompiledSource(file_path, namespace, data)
                 self.compiled_sources.append(current)
+                parents.clear()
 
                 try:
                     # compile each file individually first, make sure that works
@@ -970,6 +973,7 @@ class YaraScanner(object):
             sources[namespace] = "\r\n".join(sources[namespace])
 
         current = None
+        parents.clear()
 
         try:
             log.info("loading {} rules".format(rule_count))
