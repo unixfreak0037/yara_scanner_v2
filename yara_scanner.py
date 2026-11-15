@@ -78,11 +78,12 @@ class CompiledSource:
     path: str
     #: the namespace its rules are loaded into
     namespace: str
-    #: the text read from path, which is what was compiled
+    #: the text read from path, which is what was compiled ("" when it could not be read)
     source: str
     #: every include compiling it pulled in, nested ones too, in the order yara asked for them
     includes: List[IncludedSource] = field(default_factory=list)
-    #: why it did not compile on its own, or None. A file with an error is left out of the rules
+    #: why it could not be read or did not compile on its own, or None. A file with an error is left
+    #: out of the rules
     error: Optional[str] = None
     #: the compiler's warnings
     warnings: List[str] = field(default_factory=list)
@@ -938,13 +939,20 @@ class YaraScanner(object):
         for namespace in all_files.keys():
             for file_path in all_files[namespace]:
 
-                if not os.path.exists(file_path):
+                log.debug("loading namespace {} rule file {}".format(namespace, file_path))
+                try:
+                    with open(file_path, "r") as fp:
+                        data = fp.read()
+                except FileNotFoundError:
+                    # a tracked file that was removed, perhaps since it was listed
                     log.debug("file %s does not exist", file_path)
                     continue
-
-                with open(file_path, "r") as fp:
-                    log.debug("loading namespace {} rule file {}".format(namespace, file_path))
-                    data = fp.read()
+                except (OSError, UnicodeDecodeError) as e:
+                    # like a file that does not compile, it is left out and the rest are loaded
+                    log.error("unable to read {}: {}".format(file_path, e))
+                    self.compiled_sources.append(CompiledSource(file_path, namespace, "", error=str(e)))
+                    compilation_errors = True
+                    continue
 
                 current = CompiledSource(file_path, namespace, data)
                 self.compiled_sources.append(current)
