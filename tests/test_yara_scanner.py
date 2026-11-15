@@ -1193,3 +1193,48 @@ def test_compiled_sources_cleared_by_compiled_rules(tmp_path):
     # the second load finds the rules the first one saved
     assert scanner.load_rules()
     assert scanner.compiled_sources == []
+
+@pytest.mark.integration
+def test_nested_includes(tmp_path, monkeypatch):
+    """A nested include is relative to the file that has the include statement, in both passes and
+    whatever the working directory is."""
+    rules_dir = tmp_path / 'rules'
+    create_file(str(rules_dir / 'top.yar'), 'include "inc/inner.inc"\nrule top { condition: inner and leaf and sibling }')
+    create_file(str(rules_dir / 'inc' / 'inner.inc'),
+                'include "deeper/leaf.inc"\ninclude "sibling.inc"\nrule inner { condition: true }')
+    create_file(str(rules_dir / 'inc' / 'deeper' / 'leaf.inc'), 'rule leaf { condition: true }')
+    create_file(str(rules_dir / 'inc' / 'sibling.inc'), 'rule sibling { condition: true }')
+    # where the include used to resolve in the combined compile
+    create_file(str(rules_dir / 'deeper' / 'leaf.inc'), 'rule wrong_leaf { condition: true }')
+    create_file(str(rules_dir / 'sibling.inc'), 'rule wrong_sibling { condition: true }')
+    monkeypatch.chdir(tmp_path)
+    scanner = YaraScanner()
+    scanner.track_yara_dir(str(rules_dir))
+
+    assert scanner.load_rules()
+
+    assert [(include.name, include.path, include.error) for include in scanner.compiled_sources[0].includes] == [
+        ('inc/inner.inc', str(rules_dir / 'inc' / 'inner.inc'), None),
+        ('deeper/leaf.inc', str(rules_dir / 'inc' / 'deeper' / 'leaf.inc'), None),
+        ('sibling.inc', str(rules_dir / 'inc' / 'sibling.inc'), None),
+    ]
+    assert sorted(rule.identifier for rule in scanner.rules) == ['inner', 'leaf', 'sibling', 'top']
+
+@pytest.mark.integration
+def test_nested_includes_same_parent_name(tmp_path):
+    """Nested includes whose parents were requested by the same name, from different directories,
+    each resolve against their own parent."""
+    rules_dir = tmp_path / 'rules'
+    create_file(str(rules_dir / 'top.yar'), 'include "a/p.inc"\ninclude "b/p.inc"\nrule top { condition: true }')
+    for name in ('a', 'b'):
+        create_file(str(rules_dir / name / 'p.inc'), 'include "x.inc"')
+        create_file(str(rules_dir / name / 'x.inc'), 'include "y.inc"')
+        create_file(str(rules_dir / name / 'y.inc'), f'rule {name}_y {{ condition: true }}')
+    scanner = YaraScanner()
+    scanner.track_yara_dir(str(rules_dir))
+
+    assert scanner.load_rules()
+
+    assert [include.path for include in scanner.compiled_sources[0].includes if include.name == 'y.inc'] == [
+        str(rules_dir / 'a' / 'y.inc'), str(rules_dir / 'b' / 'y.inc')]
+    assert sorted(rule.identifier for rule in scanner.rules) == ['a_y', 'b_y', 'top']
