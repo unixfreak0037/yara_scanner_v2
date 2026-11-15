@@ -46,7 +46,7 @@ The codebase is a single flat Python module (no package directory):
 
 ### What Was Compiled
 
-`compile_and_load_rules()` compiles each file on its own, drops those that fail, then compiles the rest together (one source per namespace). An include, nested or not, is relative to the file that has the include statement. It keeps a record of it: `scanner.compiled_sources` holds one `CompiledSource` per file read (path, namespace, the text read, its `IncludedSource`s, its compile error and warnings, its rule identifiers) and `scanner.compile_error` the combined compile's error. An include is read once per load and the combined compile is given that same text, so the record is exactly what the loaded rules came from. Rules loaded from a compiled file leave the record empty.
+`compile_and_load_rules()` compiles each file on its own, drops those it cannot read or that do not compile, then compiles the rest together (one source per namespace). An include, nested or not, is relative to the file that has the include statement. It keeps a record of it: `scanner.compiled_sources` holds one `CompiledSource` per file read (path, namespace, the text read, its `IncludedSource`s, its compile error and warnings, its rule identifiers) and `scanner.compile_error` the combined compile's error. An include is read once per load and the combined compile is given that same text, so the record is exactly what the loaded rules came from. Rules loaded from a compiled file leave the record empty.
 
 ### Rule Change Detection
 

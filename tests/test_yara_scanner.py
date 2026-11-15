@@ -1238,3 +1238,56 @@ def test_nested_includes_same_parent_name(tmp_path):
     assert [include.path for include in scanner.compiled_sources[0].includes if include.name == 'y.inc'] == [
         str(rules_dir / 'a' / 'y.inc'), str(rules_dir / 'b' / 'y.inc')]
     assert sorted(rule.identifier for rule in scanner.rules) == ['a_y', 'b_y', 'top']
+
+@pytest.mark.integration
+def test_rule_file_not_utf8(tmp_path, caplog):
+    """A rule file that cannot be decoded is left out with its error, and the rest are loaded."""
+    rules_dir = tmp_path / 'rules'
+    create_file(str(rules_dir / 'good.yar'), 'rule good { condition: true }')
+    bad = str(rules_dir / 'bad.yar')
+    with open(bad, 'wb') as fp:
+        fp.write(b'rule bad { strings: $a = "\xff\xfe" condition: $a }')
+    scanner = YaraScanner()
+    scanner.track_yara_dir(str(rules_dir))
+
+    assert not scanner.load_rules()
+
+    assert [rule.identifier for rule in scanner.rules] == ['good']
+    (record,) = [record for record in scanner.compiled_sources if record.path == bad]
+    assert record.source == ''
+    assert "can't decode byte 0xff" in record.error
+    assert any(record.levelno == logging.ERROR and f'unable to read {bad}' in record.getMessage()
+               for record in caplog.records)
+
+@pytest.mark.integration
+def test_rule_file_not_readable(tmp_path, caplog):
+    """A tracked path that cannot be read (here a directory named like a rule file) is left out
+    with its error, and the rest are loaded."""
+    rules_dir = tmp_path / 'rules'
+    create_file(str(rules_dir / 'good.yar'), 'rule good { condition: true }')
+    os.makedirs(str(rules_dir / 'dir.yar'))
+    scanner = YaraScanner()
+    scanner.track_yara_dir(str(rules_dir))
+
+    assert not scanner.load_rules()
+
+    assert [rule.identifier for rule in scanner.rules] == ['good']
+    (record,) = [record for record in scanner.compiled_sources if record.path.endswith('dir.yar')]
+    assert 'Is a directory' in record.error
+    assert any(record.levelno == logging.ERROR and 'unable to read' in record.getMessage()
+               for record in caplog.records)
+
+@pytest.mark.integration
+def test_rule_file_removed(tmp_path):
+    """A tracked file that is gone when the rules are loaded is skipped, and is not an error."""
+    rules_dir = tmp_path / 'rules'
+    create_file(str(rules_dir / 'good.yar'), 'rule good { condition: true }')
+    gone = create_file(str(rules_dir / 'gone.yar'), 'rule gone { condition: true }')
+    scanner = YaraScanner()
+    scanner.track_yara_dir(str(rules_dir))
+    os.remove(gone)
+
+    assert scanner.load_rules()
+
+    assert [rule.identifier for rule in scanner.rules] == ['good']
+    assert [record.path for record in scanner.compiled_sources] == [str(rules_dir / 'good.yar')]
