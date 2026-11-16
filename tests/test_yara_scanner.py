@@ -1611,24 +1611,100 @@ def test_symlinked_rule_file_inside_boundary(tmp_path):
     assert scanner.load_rules()
     assert sorted(rule.identifier for rule in scanner.rules) == ['linked', 'shared']
 
+def create_linked_rule_set(tmp_path, signature_dir):
+    """A rule set kept outside the signature directory (a checkout of its own) and linked into it as
+    signature_dir/linked, the layout ACE uses for a rule repository it checks out itself."""
+    checkout = tmp_path / 'checkout' / 'linked'
+    create_file(str(checkout / 'own.inc'), 'rule linked_own { condition: true }')
+    os.symlink(str(checkout), str(signature_dir / 'linked'))
+    return checkout
+
 @pytest.mark.integration
-def test_symlinked_rule_set_outside_signature_dir_refused(tmp_path):
-    """The rule files of a directory of the signature directory that is a link out of it are left out."""
+def test_linked_rule_set_in_signature_dir(tmp_path, caplog):
+    """A directory of the signature directory can be a link out of it: its rule files are read, and
+    includes reach through the link from the set itself and from the sets next to it."""
     signature_dir, _ = create_signature_dir(tmp_path)
-    create_file(str(signature_dir / 'acme' / 'good.yar'), 'rule good { condition: true }')
-    create_file(str(tmp_path / 'elsewhere' / 'rule.yar'), 'rule elsewhere { condition: true }')
-    os.symlink(str(tmp_path / 'elsewhere'), str(signature_dir / 'linked'))
+    checkout = create_linked_rule_set(tmp_path, signature_dir)
+    create_file(str(checkout / 'rule.yar'),
+                'include "own.inc"\ninclude "../common/shared.inc"\n'
+                'rule linked { condition: linked_own and shared }')
+    create_file(str(checkout / 'sub' / 'nested.inc'), 'rule linked_nested { condition: true }')
+    create_file(str(checkout / 'nested.yar'), 'include "sub/nested.inc"\nrule uses_nested { condition: true }')
+    create_file(str(signature_dir / 'acme' / 'rule.yar'),
+                'include "../linked/own.inc"\nrule acme { condition: linked_own }')
+    scanner = YaraScanner(signature_dir=str(signature_dir))
+
+    with caplog.at_level(logging.ERROR):
+        assert scanner.load_rules()
+
+    assert not caplog.records
+    assert scanner.compile_error is None
+    assert [(_.path, _.error) for _ in scanner.compiled_sources if _.error is not None] == []
+    assert all(include.error is None for _ in scanner.compiled_sources for include in _.includes)
+    # acme includes linked_own into its own namespace
+    assert sorted(rule.identifier for rule in scanner.rules) == [
+        'acme', 'linked', 'linked_nested', 'linked_own', 'linked_own', 'shared', 'uses_nested']
+
+    # tracked by the content of the files the link leads to, not by the link
+    assert not scanner.rules_changed()
+    time.sleep(0.01)
+    create_file(str(checkout / 'rule.yar'), 'rule linked { condition: true }')
+    assert scanner.rules_changed()
+
+@pytest.mark.integration
+def test_linked_rule_set_does_not_open_the_boundary(tmp_path, caplog):
+    """Only the linked directory itself is followed: a link inside the linked rule set, or a rule
+    file of it that resolves outside, is refused as anywhere else."""
+    signature_dir, outside = create_signature_dir(tmp_path)
+    checkout = create_linked_rule_set(tmp_path, signature_dir)
+    os.symlink(os.path.dirname(outside), str(checkout / 'escape'))
+    os.symlink(outside, str(checkout / 'escape.inc'))
+    os.symlink(outside, str(checkout / 'escape.yar'))
+    create_file(str(checkout / 'rule.yar'), 'include "escape/outside.yar"\ninclude "escape.inc"\n'
+                'include "../../outside.yar"\nrule linked { condition: true }')
     scanner = YaraScanner(signature_dir=str(signature_dir))
 
     assert not scanner.load_rules()
-    assert [rule.identifier for rule in scanner.rules] == ['good']
+    assert [rule.identifier for rule in scanner.rules] == ['linked']
 
-    # tracked by name, the directory is its own boundary
+    by_path = {_.path: _ for _ in scanner.compiled_sources}
+    assert by_path[str(signature_dir / 'linked' / 'escape.yar')].error == \
+        'rule file refused: it resolves to a path outside the include boundary'
+    assert [include.error for include in by_path[str(signature_dir / 'linked' / 'rule.yar')].includes] == [
+        'include refused: the path goes through a symbolic link',
+        'include refused: the path goes through a symbolic link',
+        'include refused: the path leaves the include boundary',
+    ]
+    assert not [_ for _ in everything_reported(scanner, caplog) if OUTSIDE_MARKER in _]
+
+@pytest.mark.integration
+@pytest.mark.skipif(not shutil.which('git'), reason="missing git in PATH")
+def test_linked_repository_in_signature_dir(tmp_path):
+    """A directory of the signature directory named in git_repo_dirs can be a link to a checkout."""
+    signature_dir, _ = create_signature_dir(tmp_path)
+    checkout = create_linked_rule_set(tmp_path, signature_dir)
+    create_file(str(checkout / 'rule.yar'), 'include "own.inc"\nrule linked { condition: linked_own }')
+    for args in (['init'], ['add', '-A'],
+                 ['-c', 'user.name=Test', '-c', 'user.email=test@localhost', 'commit', '-m', 'rules']):
+        assert Popen(['git', '-C', str(checkout)] + args).wait() == 0
+
+    scanner = YaraScanner(signature_dir=str(signature_dir), git_repo_dirs=['linked'])
+
+    assert list(scanner.tracked_repos) == [str(signature_dir / 'linked')]
+    assert scanner.load_rules()
+    assert sorted(rule.identifier for rule in scanner.rules) == ['linked', 'linked_own']
+
+@pytest.mark.integration
+def test_linked_rule_set_tracked_by_name(tmp_path):
+    """A directory tracked by name is its own boundary wherever it resolves to."""
+    signature_dir, _ = create_signature_dir(tmp_path)
+    checkout = create_linked_rule_set(tmp_path, signature_dir)
+    create_file(str(checkout / 'rule.yar'), 'include "own.inc"\nrule linked { condition: linked_own }')
     scanner = YaraScanner()
     scanner.track_yara_dir(str(signature_dir / 'linked'))
 
     assert scanner.load_rules()
-    assert [rule.identifier for rule in scanner.rules] == ['elsewhere']
+    assert sorted(rule.identifier for rule in scanner.rules) == ['linked', 'linked_own']
 
 @pytest.mark.integration
 def test_symlinked_tracked_file(tmp_path):
@@ -1699,6 +1775,36 @@ def test_open_include(tmp_path):
 
     with pytest.raises(FileNotFoundError):
         open_include(str(boundary / 'a'), 'missing.inc', str(boundary))
+
+@pytest.mark.unit
+def test_open_include_tracked_dir_link(tmp_path):
+    """A link that is one of the tracked directories is followed; no other link is."""
+    boundary = tmp_path / 'boundary'
+    os.makedirs(str(boundary / 'a'))
+    create_file(str(tmp_path / 'checkout' / 'inside.inc'), 'linked')
+    create_file(str(tmp_path / 'checkout' / 'sub' / 'deeper.inc'), 'deeper')
+    os.symlink(str(tmp_path / 'checkout'), str(boundary / 'link'))
+    os.symlink(str(tmp_path / 'checkout'), str(boundary / 'other'))
+    os.symlink(str(tmp_path / 'checkout' / 'inside.inc'), str(boundary / 'file.inc'))
+    os.symlink(str(tmp_path / 'checkout' / 'sub'), str(tmp_path / 'checkout' / 'sublink'))
+    tracked_dirs = [str(boundary / 'link')]
+
+    for dir_name, name, content in [
+        (boundary / 'link', 'inside.inc', 'linked'),
+        (boundary / 'link', 'sub/deeper.inc', 'deeper'),
+        (boundary / 'a', '../link/inside.inc', 'linked'),
+    ]:
+        with open_include(str(dir_name), name, str(boundary), tracked_dirs) as fp:
+            assert fp.read() == content
+
+    for dir_name, name in [
+        (boundary / 'other', 'inside.inc'),        # a link that is not a tracked directory
+        (boundary / 'link', 'sublink/deeper.inc'),  # a link below the tracked one
+        (boundary / 'link', '../link'),             # the tracked directory itself
+        (boundary / 'a', '../file.inc'),            # a link to a file
+    ]:
+        with pytest.raises(IncludeRefusedError):
+            open_include(str(dir_name), name, str(boundary), tracked_dirs)
 
 @pytest.mark.integration
 def test_auto_compile_include_boundary(tmp_path):

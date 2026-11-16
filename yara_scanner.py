@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # vim: sw=4:ts=4:et:cc=120
-__version__ = "3.2.0"
+__version__ = "3.2.1"
 __doc__ = """
 Yara Scanner v2
 ============
@@ -36,6 +36,7 @@ A wrapper around the yara library for Python. ::
 import csv
 import functools
 import io
+import itertools
 import json
 import logging
 import os
@@ -51,7 +52,7 @@ from operator import itemgetter
 import hashlib
 import tempfile
 from subprocess import PIPE, Popen
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional
 
 import plyara, plyara.utils
 import progress.bar
@@ -108,7 +109,7 @@ def _is_inside(path: str, root: str) -> bool:
     return path.startswith(root.rstrip(os.sep) + os.sep)
 
 
-def open_include(dir_name: str, requested_filename: str, boundary: str):
+def open_include(dir_name: str, requested_filename: str, boundary: str, tracked_dirs: Iterable[str] = ()):
     """Opens the file an include statement in a file of dir_name names, when it is a regular file
     inside the directory boundary that is reached through no symbolic link. Anything else raises
     :class:`IncludeRefusedError`, before it is opened.
@@ -116,8 +117,11 @@ def open_include(dir_name: str, requested_filename: str, boundary: str):
     An absolute name and a name that leaves the boundary are refused from the text of the path
     alone, so the refusal is the same whether or not the file exists. The filesystem is looked at
     only below the boundary, one path component at a time, and a symbolic link is refused where it
-    is found, without looking at what it points to. The path opened is the normalized one that was
-    checked. A file missing inside the boundary raises FileNotFoundError, as it always has."""
+    is found, without looking at what it points to. The one exception is a link that is one of
+    tracked_dirs, the directories inside the boundary that rules are tracked in: whoever tracked
+    them chose them, so a rule set linked into a signature directory is followed into, but nothing
+    below it is. The path opened is the normalized one that was checked. A file missing inside the
+    boundary raises FileNotFoundError, as it always has."""
     if os.path.isabs(requested_filename):
         raise IncludeRefusedError("include refused: an absolute path is not allowed")
 
@@ -129,12 +133,16 @@ def open_include(dir_name: str, requested_filename: str, boundary: str):
     if not _is_inside(target, root):
         raise IncludeRefusedError("include refused: the path leaves the include boundary")
 
+    followed = {os.path.abspath(_) for _ in tracked_dirs}
     current = root
     for part in os.path.relpath(target, root).split(os.sep):
         current = os.path.join(current, part)
         mode = os.lstat(current).st_mode
         if stat.S_ISLNK(mode):
-            raise IncludeRefusedError("include refused: the path goes through a symbolic link")
+            if current not in followed:
+                raise IncludeRefusedError("include refused: the path goes through a symbolic link")
+
+            mode = os.stat(current).st_mode
 
     if not stat.S_ISREG(mode):
         raise IncludeRefusedError("include refused: not a regular file")
@@ -142,13 +150,21 @@ def open_include(dir_name: str, requested_filename: str, boundary: str):
     return open(target, "r")
 
 
-def rule_file_refusal(file_path: str, boundary: str) -> Optional[str]:
+def rule_file_refusal(file_path: str, boundary: str, tracked_dirs: Iterable[str] = ()) -> Optional[str]:
     """Returns why a rule file found by listing a directory is not read, or None when it can be.
     The file can be a symbolic link, or be reached through one, as long as what it resolves to is
-    inside the directory boundary. Whether the target of a link out of the boundary exists makes no
-    difference to the answer."""
-    if _is_inside(os.path.realpath(file_path), os.path.realpath(boundary)):
+    inside the directory boundary, or inside what one of tracked_dirs resolves to (a tracked
+    directory can be a link out of the boundary, see :func:`open_include`). Whether the target of a
+    link out of the boundary exists makes no difference to the answer."""
+    resolved = os.path.realpath(file_path)
+    if _is_inside(resolved, os.path.realpath(boundary)):
         return None
+
+    # resolved one at a time: a file of the default layout never gets here, and the caller passes
+    # the file's own directory first
+    for dir_path in tracked_dirs:
+        if _is_inside(resolved, os.path.realpath(dir_path)):
+            return None
 
     return "rule file refused: it resolves to a path outside the include boundary"
 
@@ -447,10 +463,28 @@ class YaraScanner(object):
 
         return namespace
 
+    def get_tracked_dirs_inside(self, boundary, first=None):
+        """Returns the tracked directories (and repositories) inside the given include boundary,
+        first (a namespace) at the head of the list when it is one of them. Any of them can be a
+        symbolic link out of the boundary, see :func:`open_include`."""
+        root = os.path.abspath(boundary)
+        dir_paths = [_ for _ in itertools.chain(self.tracked_dirs, self.tracked_repos)
+                     if _is_inside(os.path.abspath(_), root)]
+        if first in dir_paths:
+            dir_paths.remove(first)
+            dir_paths.insert(0, first)
+
+        return dir_paths
+
+    def _rule_file_refusal(self, namespace, file_path):
+        """Why a rule file found by listing the directory of the namespace is not read, or None."""
+        boundary = self.get_include_boundary(namespace)
+        return rule_file_refusal(file_path, boundary, self.get_tracked_dirs_inside(boundary, first=namespace))
+
     def _rule_file_mtime(self, dir_path, file_path):
         """The modification time a file of a tracked directory is tracked by. A link out of the
         boundary is not read, so it is tracked by the link itself and not by what it points to."""
-        if not self.allow_includes_outside and rule_file_refusal(file_path, self.get_include_boundary(dir_path)):
+        if not self.allow_includes_outside and self._rule_file_refusal(dir_path, file_path):
             try:
                 return os.lstat(file_path).st_mtime
             except OSError:
@@ -943,7 +977,7 @@ class YaraScanner(object):
                     namespace: [
                         _ for _ in file_paths
                         if namespace in self.tracked_files
-                        or rule_file_refusal(_, self.get_include_boundary(namespace)) is None
+                        or self._rule_file_refusal(namespace, _) is None
                     ]
                     for namespace, file_paths in namespaces.items()
                 }
@@ -1031,7 +1065,7 @@ class YaraScanner(object):
                 else:
                     # refused before it is opened unless it is a regular file inside the boundary
                     boundary = self.get_include_boundary(namespace if current is None else current.namespace)
-                    fp = open_include(dir_name, requested_filename, boundary)
+                    fp = open_include(dir_name, requested_filename, boundary, self.get_tracked_dirs_inside(boundary))
 
                 with fp:
                     return IncludedSource(requested_filename, relative_path, fp.read())
@@ -1094,7 +1128,7 @@ class YaraScanner(object):
                     # a file the caller tracked by name is read whatever it is; one found by listing
                     # a directory must not be a link out of the boundary
                     if not self.allow_includes_outside and namespace not in self.tracked_files:
-                        refusal = rule_file_refusal(file_path, self.get_include_boundary(namespace))
+                        refusal = self._rule_file_refusal(namespace, file_path)
                         if refusal is not None:
                             raise IncludeRefusedError(refusal)
 
