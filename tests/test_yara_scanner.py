@@ -14,7 +14,8 @@ from yara_scanner import (ALL_RESULT_KEYS, RESULT_KEY_COMMIT, RESULT_KEY_META,
                           RESULT_KEY_NAMESPACE, RESULT_KEY_RULE,
                           RESULT_KEY_STRINGS, RESULT_KEY_TAGS,
                           RESULT_KEY_TARGET, YaraScanner, __version__, RulesNotLoadedError,
-                          get_current_repo_commit, CompiledSource, IncludedSource)
+                          get_current_repo_commit, CompiledSource, IncludedSource,
+                          IncludeRefusedError, open_include)
 
 def create_file(path, content):
     dir = os.path.dirname(path)
@@ -1291,3 +1292,442 @@ def test_rule_file_removed(tmp_path):
 
     assert [rule.identifier for rule in scanner.rules] == ['good']
     assert [record.path for record in scanner.compiled_sources] == [str(rules_dir / 'good.yar')]
+
+#
+# the include boundary
+#
+
+# what a file outside the boundary holds: a rule that would load if the file were read, and a
+# module name yara would quote in its error
+OUTSIDE_MARKER = 'outside_marker_7f3a'
+OUTSIDE_CONTENT = f'import "{OUTSIDE_MARKER}_module"\nrule {OUTSIDE_MARKER} {{ condition: true }}\n'
+
+def create_signature_dir(tmp_path):
+    """A signature directory with a rule set `common`, and a file outside of it, one directory up."""
+    signature_dir = tmp_path / 'top' / 'signatures'
+    create_file(str(signature_dir / 'common' / 'shared.inc'), 'rule shared { condition: true }')
+    outside = create_file(str(tmp_path / 'top' / 'outside.yar'), OUTSIDE_CONTENT)
+    return signature_dir, outside
+
+def create_escaping_include(signature_dir, outside, escape):
+    """Returns the name an include statement in signature_dir/acme uses to reach the outside file."""
+    acme = signature_dir / 'acme'
+    os.makedirs(str(acme), exist_ok=True)
+    if escape == 'absolute':
+        return outside
+    elif escape == 'parent':
+        return '../../outside.yar'
+    elif escape == 'parent_after_subdir':
+        os.makedirs(str(acme / 'sub'))
+        return 'sub/../../../outside.yar'
+    elif escape == 'symlink':
+        os.symlink(outside, str(acme / 'link.inc'))
+        return 'link.inc'
+    elif escape == 'relative_symlink':
+        os.symlink('../../outside.yar', str(acme / 'link.inc'))
+        return 'link.inc'
+    elif escape == 'symlinked_dir':
+        os.symlink(os.path.dirname(outside), str(acme / 'linked'))
+        return 'linked/outside.yar'
+
+    raise ValueError(escape)
+
+def everything_reported(scanner, caplog):
+    """Every piece of text a load reports: the errors, the text compiled and the log."""
+    reported = [scanner.compile_error]
+    for compiled in scanner.compiled_sources:
+        reported.extend([compiled.source, compiled.error, *compiled.warnings, *compiled.rules])
+        for include in compiled.includes:
+            reported.extend([include.source, include.error])
+
+    reported.extend(record.getMessage() for record in caplog.records)
+    return [_ for _ in reported if _ is not None]
+
+INCLUDE_ESCAPES = ['absolute', 'parent', 'parent_after_subdir', 'symlink', 'relative_symlink', 'symlinked_dir']
+
+@pytest.mark.integration
+def test_include_inside_signature_dir(tmp_path):
+    """A rule set can include a file of the rule set next to it in the signature directory."""
+    signature_dir, _ = create_signature_dir(tmp_path)
+    create_file(str(signature_dir / 'acme' / 'rule.yar'),
+                'include "../common/shared.inc"\nrule own { condition: shared }')
+    scanner = YaraScanner(signature_dir=str(signature_dir))
+
+    assert scanner.load_rules()
+
+    (compiled,) = scanner.compiled_sources
+    (include,) = compiled.includes
+    assert include == IncludedSource('../common/shared.inc', str(signature_dir / 'acme' / '../common/shared.inc'),
+                                     'rule shared { condition: true }')
+    assert sorted(rule.identifier for rule in scanner.rules) == ['own', 'shared']
+
+@pytest.mark.integration
+def test_include_inside_tracked_dir(tmp_path):
+    """Inside a tracked directory an include can go down, and back up as far as the directory."""
+    rules_dir = tmp_path / 'rules'
+    create_file(str(rules_dir / 'top.yar'), 'include "sets/a/a.inc"\nrule top { condition: a and shared }')
+    create_file(str(rules_dir / 'sets' / 'a' / 'a.inc'), 'include "../common/shared.inc"\nrule a { condition: true }')
+    create_file(str(rules_dir / 'sets' / 'common' / 'shared.inc'), 'rule shared { condition: true }')
+    scanner = YaraScanner()
+    scanner.track_yara_dir(str(rules_dir))
+
+    assert scanner.load_rules()
+
+    assert [include.error for include in scanner.compiled_sources[0].includes] == [None, None]
+    assert sorted(rule.identifier for rule in scanner.rules) == ['a', 'shared', 'top']
+
+@pytest.mark.integration
+@pytest.mark.parametrize('escape', INCLUDE_ESCAPES)
+def test_include_outside_boundary_refused(tmp_path, caplog, escape):
+    """An include that is absolute, leaves the boundary or goes through a symbolic link is compiled
+    as empty and recorded with its error, like an include that cannot be read. Nothing of the file
+    it names is reported."""
+    signature_dir, outside = create_signature_dir(tmp_path)
+    name = create_escaping_include(signature_dir, outside, escape)
+    create_file(str(signature_dir / 'acme' / 'rule.yar'), f'include "{name}"\nrule own {{ condition: true }}')
+    scanner = YaraScanner(signature_dir=str(signature_dir))
+
+    assert scanner.load_rules()
+
+    (compiled,) = scanner.compiled_sources
+    (include,) = compiled.includes
+    assert include.name == name
+    assert include.path == os.path.join(str(signature_dir / 'acme'), name)
+    assert include.source == ''
+    assert include.error.startswith('include refused: ')
+    assert compiled.error is None
+    assert [rule.identifier for rule in scanner.rules] == ['own']
+    assert any(record.levelno == logging.ERROR and 'unable to include file' in record.getMessage()
+               for record in caplog.records)
+    assert not any(OUTSIDE_MARKER in text for text in everything_reported(scanner, caplog))
+
+@pytest.mark.integration
+@pytest.mark.parametrize('escape', INCLUDE_ESCAPES)
+def test_include_refusal_same_for_missing_file(tmp_path, caplog, escape):
+    """What is reported for an include out of the boundary does not say whether the file exists."""
+    signature_dir, outside = create_signature_dir(tmp_path)
+    name = create_escaping_include(signature_dir, outside, escape)
+    create_file(str(signature_dir / 'acme' / 'rule.yar'), f'include "{name}"\nrule own {{ condition: true }}')
+
+    def load():
+        caplog.clear()
+        scanner = YaraScanner(signature_dir=str(signature_dir))
+        return scanner.load_rules(), scanner.compiled_sources, everything_reported(scanner, caplog)
+
+    with_file = load()
+    os.remove(outside)
+    without_file = load()
+
+    assert with_file == without_file
+    assert with_file[1][0].includes[0].error.startswith('include refused: ')
+
+@pytest.mark.integration
+def test_include_nested_outside_boundary_refused(tmp_path, caplog):
+    """The boundary holds for the include of an include, in both passes."""
+    signature_dir, outside = create_signature_dir(tmp_path)
+    create_file(str(signature_dir / 'acme' / 'rule.yar'), 'include "../common/nested.inc"\nrule own { condition: true }')
+    create_file(str(signature_dir / 'common' / 'nested.inc'), 'include "../../outside.yar"\nrule nested { condition: true }')
+    scanner = YaraScanner(signature_dir=str(signature_dir))
+
+    assert scanner.load_rules()
+
+    (compiled,) = [_ for _ in scanner.compiled_sources if _.path.endswith('rule.yar')]
+    assert [(include.name, include.source == '', include.error) for include in compiled.includes] == [
+        ('../common/nested.inc', False, None),
+        ('../../outside.yar', True, 'include refused: the path leaves the include boundary'),
+    ]
+    assert sorted(rule.identifier for rule in scanner.rules) == ['nested', 'own']
+    assert not any(OUTSIDE_MARKER in text for text in everything_reported(scanner, caplog))
+
+@pytest.mark.integration
+def test_include_not_a_regular_file_refused(tmp_path):
+    rules_dir = tmp_path / 'rules'
+    create_file(str(rules_dir / 'top.yar'), 'include "sub"\ninclude "."\nrule top { condition: true }')
+    os.makedirs(str(rules_dir / 'sub'))
+    scanner = YaraScanner()
+    scanner.track_yara_dir(str(rules_dir))
+
+    assert scanner.load_rules()
+
+    assert [include.error for include in scanner.compiled_sources[0].includes] == [
+        'include refused: not a regular file', 'include refused: not a regular file']
+
+@pytest.mark.integration
+def test_include_symlink_inside_boundary_refused(tmp_path):
+    """An include is reached through no symbolic link, even one that points inside the boundary."""
+    rules_dir = tmp_path / 'rules'
+    create_file(str(rules_dir / 'top.yar'), 'include "link.inc"\nrule top { condition: true }')
+    os.symlink(create_file(str(rules_dir / 'real.inc'), 'rule real { condition: true }'), str(rules_dir / 'link.inc'))
+    scanner = YaraScanner()
+    scanner.track_yara_dir(str(rules_dir))
+
+    assert scanner.load_rules()
+
+    assert scanner.compiled_sources[0].includes[0].error == 'include refused: the path goes through a symbolic link'
+    assert [rule.identifier for rule in scanner.rules] == ['top']
+
+@pytest.mark.integration
+def test_include_boundary_of_tracked_dir(tmp_path):
+    """A directory tracked on its own is its own boundary, unless it is tracked with a wider one."""
+    create_file(str(tmp_path / 'rules' / 'acme' / 'rule.yar'), 'include "../common/shared.inc"\nrule own { condition: true }')
+    create_file(str(tmp_path / 'rules' / 'common' / 'shared.inc'), 'rule shared { condition: true }')
+    scanner = YaraScanner()
+    scanner.track_yara_dir(str(tmp_path / 'rules' / 'acme'))
+
+    assert scanner.load_rules()
+    assert scanner.compiled_sources[0].includes[0].error == 'include refused: the path leaves the include boundary'
+    assert [rule.identifier for rule in scanner.rules] == ['own']
+
+    scanner = YaraScanner()
+    scanner.track_yara_dir(str(tmp_path / 'rules' / 'acme'), include_boundary=str(tmp_path / 'rules'))
+
+    assert scanner.load_rules()
+    assert scanner.compiled_sources[0].includes[0].error is None
+    assert sorted(rule.identifier for rule in scanner.rules) == ['own', 'shared']
+
+    # the boundary is kept when a change re-tracks the directory
+    create_file(str(tmp_path / 'rules' / 'acme' / 'new.yar'), 'rule new { condition: true }')
+    assert scanner.rules_changed()
+    assert scanner.load_rules()
+    assert sorted(rule.identifier for rule in scanner.rules) == ['new', 'own', 'shared']
+
+@pytest.mark.integration
+def test_include_boundary_of_tracked_file(tmp_path):
+    """The boundary of a file tracked on its own is the directory it is in."""
+    rule_path = create_file(str(tmp_path / 'rules' / 'top.yar'),
+                            'include "inc/inner.inc"\ninclude "../outside.inc"\nrule top { condition: inner }')
+    create_file(str(tmp_path / 'rules' / 'inc' / 'inner.inc'), 'rule inner { condition: true }')
+    create_file(str(tmp_path / 'outside.inc'), 'rule outside { condition: true }')
+    scanner = YaraScanner()
+    scanner.track_yara_file(rule_path)
+
+    assert scanner.load_rules()
+    assert [include.error for include in scanner.compiled_sources[0].includes] == [
+        None, 'include refused: the path leaves the include boundary']
+    assert sorted(rule.identifier for rule in scanner.rules) == ['inner', 'top']
+
+    scanner = YaraScanner()
+    scanner.track_yara_file(rule_path, include_boundary=str(tmp_path))
+
+    assert scanner.load_rules()
+    assert sorted(rule.identifier for rule in scanner.rules) == ['inner', 'outside', 'top']
+
+@pytest.mark.integration
+def test_include_boundary_of_tracked_file_relative_path(tmp_path, monkeypatch):
+    """A file tracked by its name alone is bounded by the current directory."""
+    create_file(str(tmp_path / 'rules' / 'top.yar'), 'include "inner.inc"\ninclude "../outside.inc"\nrule top { condition: inner }')
+    create_file(str(tmp_path / 'rules' / 'inner.inc'), 'rule inner { condition: true }')
+    create_file(str(tmp_path / 'outside.inc'), 'rule outside { condition: true }')
+    monkeypatch.chdir(str(tmp_path / 'rules'))
+    scanner = YaraScanner()
+    scanner.track_yara_file('top.yar')
+
+    assert scanner.load_rules()
+    assert sorted(rule.identifier for rule in scanner.rules) == ['inner', 'top']
+
+@pytest.mark.integration
+@pytest.mark.skipif(not shutil.which('git'), reason="missing git in PATH")
+def test_include_boundary_of_tracked_repository(parent_repo, shared_datadir):
+    """A tracked repository directory is its own boundary; the root of the repository can be given."""
+    ruleset = shared_datadir / 'signatures' / 'ruleset_a'
+    create_file(str(ruleset / 'uses_shared.yar'), 'include "../../shared.inc"\nrule uses_shared { condition: true }')
+    create_file(str(shared_datadir / 'shared.inc'), 'rule shared { condition: true }')
+    scanner = YaraScanner()
+    scanner.track_yara_repository(str(ruleset))
+
+    scanner.load_rules()
+    (compiled,) = [_ for _ in scanner.compiled_sources if _.path.endswith('uses_shared.yar')]
+    assert compiled.includes[0].error == 'include refused: the path leaves the include boundary'
+    assert 'shared' not in [rule.identifier for rule in scanner.rules]
+
+    scanner = YaraScanner()
+    scanner.track_yara_repository(str(ruleset), include_boundary=parent_repo)
+
+    scanner.load_rules()
+    (compiled,) = [_ for _ in scanner.compiled_sources if _.path.endswith('uses_shared.yar')]
+    assert compiled.includes[0].error is None
+    assert 'shared' in [rule.identifier for rule in scanner.rules]
+
+@pytest.mark.integration
+def test_include_boundary_of_untracked_namespace(tmp_path):
+    """A directory put in tracked_dirs by hand is bounded by itself, or by its include_boundaries entry."""
+    rules_dir = tmp_path / 'rules' / 'acme'
+    rule_path = create_file(str(rules_dir / 'rule.yar'), 'include "../common/shared.inc"\nrule own { condition: true }')
+    create_file(str(tmp_path / 'rules' / 'common' / 'shared.inc'), 'rule shared { condition: true }')
+    scanner = YaraScanner()
+    scanner.tracked_dirs[str(rules_dir) + '/.'] = {rule_path: None}
+
+    assert scanner.load_rules()
+    assert [rule.identifier for rule in scanner.rules] == ['own']
+
+    scanner.include_boundaries[str(rules_dir) + '/.'] = str(tmp_path / 'rules')
+
+    assert scanner.load_rules()
+    assert sorted(rule.identifier for rule in scanner.rules) == ['own', 'shared']
+
+@pytest.mark.integration
+def test_symlinked_rule_file_outside_boundary_refused(tmp_path, caplog):
+    """A rule file found in a tracked directory that is a link out of the boundary is left out with
+    its error, the same one whether or not its target exists, and the rest are loaded."""
+    signature_dir, outside = create_signature_dir(tmp_path)
+    create_file(str(signature_dir / 'acme' / 'good.yar'), 'rule good { condition: true }')
+    link = str(signature_dir / 'acme' / 'link.yar')
+    os.symlink(outside, link)
+
+    def load():
+        caplog.clear()
+        scanner = YaraScanner(signature_dir=str(signature_dir))
+        return scanner.load_rules(), scanner.compiled_sources, everything_reported(scanner, caplog), scanner
+
+    with_file = load()
+    scanner = with_file[3]
+    assert not with_file[0]
+    assert [rule.identifier for rule in scanner.rules] == ['good']
+    (record,) = [record for record in scanner.compiled_sources if record.path == link]
+    assert record == CompiledSource(link, str(signature_dir / 'acme'), '',
+                                    error='rule file refused: it resolves to a path outside the include boundary')
+    assert any(record.levelno == logging.ERROR and f'unable to read {link}' in record.getMessage()
+               for record in caplog.records)
+    assert not any(OUTSIDE_MARKER in text for text in with_file[2])
+
+    # rules_changed() does not tell the two apart either
+    assert not scanner.rules_changed()
+    os.remove(outside)
+    assert not scanner.rules_changed()
+    without_file = load()
+    assert with_file[:3] == without_file[:3]
+
+@pytest.mark.integration
+def test_symlinked_rule_file_inside_boundary(tmp_path):
+    """A rule file that is a link to a file inside the boundary is loaded, and its includes are
+    relative to where the link is."""
+    signature_dir, _ = create_signature_dir(tmp_path)
+    create_file(str(signature_dir / 'available' / 'rule.yar.disabled'),
+                'include "../common/shared.inc"\nrule linked { condition: shared }')
+    os.makedirs(str(signature_dir / 'enabled'))
+    os.symlink('../available/rule.yar.disabled', str(signature_dir / 'enabled' / 'rule.yar'))
+    scanner = YaraScanner(signature_dir=str(signature_dir))
+
+    assert scanner.load_rules()
+    assert sorted(rule.identifier for rule in scanner.rules) == ['linked', 'shared']
+
+@pytest.mark.integration
+def test_symlinked_rule_set_outside_signature_dir_refused(tmp_path):
+    """The rule files of a directory of the signature directory that is a link out of it are left out."""
+    signature_dir, _ = create_signature_dir(tmp_path)
+    create_file(str(signature_dir / 'acme' / 'good.yar'), 'rule good { condition: true }')
+    create_file(str(tmp_path / 'elsewhere' / 'rule.yar'), 'rule elsewhere { condition: true }')
+    os.symlink(str(tmp_path / 'elsewhere'), str(signature_dir / 'linked'))
+    scanner = YaraScanner(signature_dir=str(signature_dir))
+
+    assert not scanner.load_rules()
+    assert [rule.identifier for rule in scanner.rules] == ['good']
+
+    # tracked by name, the directory is its own boundary
+    scanner = YaraScanner()
+    scanner.track_yara_dir(str(signature_dir / 'linked'))
+
+    assert scanner.load_rules()
+    assert [rule.identifier for rule in scanner.rules] == ['elsewhere']
+
+@pytest.mark.integration
+def test_symlinked_tracked_file(tmp_path):
+    """A file tracked by name is read even when it is a link: the caller chose it."""
+    target = create_file(str(tmp_path / 'elsewhere' / 'rule.yar'), 'rule elsewhere { condition: true }')
+    os.makedirs(str(tmp_path / 'rules'))
+    os.symlink(target, str(tmp_path / 'rules' / 'link.yar'))
+    scanner = YaraScanner()
+    scanner.track_yara_file(str(tmp_path / 'rules' / 'link.yar'))
+
+    assert scanner.load_rules()
+    assert [rule.identifier for rule in scanner.rules] == ['elsewhere']
+
+@pytest.mark.integration
+@pytest.mark.parametrize('escape', INCLUDE_ESCAPES)
+def test_allow_includes_outside(tmp_path, escape):
+    """allow_includes_outside reads whatever an include names, as before 3.2.0."""
+    signature_dir, outside = create_signature_dir(tmp_path)
+    create_file(outside, 'rule outside { condition: true }')
+    name = create_escaping_include(signature_dir, outside, escape)
+    create_file(str(signature_dir / 'acme' / 'rule.yar'), f'include "{name}"\nrule own {{ condition: outside }}')
+    scanner = YaraScanner(signature_dir=str(signature_dir), allow_includes_outside=True)
+
+    assert scanner.load_rules()
+
+    (include,) = scanner.compiled_sources[0].includes
+    assert include == IncludedSource(name, os.path.join(str(signature_dir / 'acme'), name), 'rule outside { condition: true }')
+    assert sorted(rule.identifier for rule in scanner.rules) == ['outside', 'own']
+
+@pytest.mark.integration
+def test_allow_includes_outside_symlinked_rule_file(tmp_path):
+    signature_dir, outside = create_signature_dir(tmp_path)
+    create_file(outside, 'rule outside { condition: true }')
+    os.makedirs(str(signature_dir / 'acme'))
+    os.symlink(outside, str(signature_dir / 'acme' / 'link.yar'))
+    scanner = YaraScanner(signature_dir=str(signature_dir), allow_includes_outside=True)
+
+    assert scanner.load_rules()
+    assert [rule.identifier for rule in scanner.rules] == ['outside']
+
+@pytest.mark.unit
+def test_open_include(tmp_path):
+    boundary = tmp_path / 'boundary'
+    create_file(str(boundary / 'a' / 'inside.inc'), 'inside')
+    create_file(str(tmp_path / 'outside.inc'), 'outside')
+    os.symlink(str(boundary / 'a'), str(boundary / 'link'))
+
+    with open_include(str(boundary / 'a'), 'inside.inc', str(boundary)) as fp:
+        assert fp.read() == 'inside'
+
+    # out and back in is inside
+    with open_include(str(boundary / 'a'), '../../boundary/a/inside.inc', str(boundary)) as fp:
+        assert fp.read() == 'inside'
+
+    for dir_name, name in [
+        (boundary / 'a', str(boundary / 'a' / 'inside.inc')),   # absolute, even to a file inside
+        (boundary / 'a', '../../outside.inc'),
+        (boundary / 'a', '../../missing.inc'),
+        (boundary / 'a', '../link/inside.inc'),
+        (boundary / 'link', 'inside.inc'),
+        (boundary / 'a', '..'),
+        (boundary / 'a', '../..'),
+        (tmp_path, 'outside.inc'),                                # the including file is outside
+        (tmp_path / 'boundary_not', 'x.inc'),                     # shares a prefix with the boundary
+    ]:
+        with pytest.raises(IncludeRefusedError):
+            open_include(str(dir_name), name, str(boundary))
+
+    with pytest.raises(FileNotFoundError):
+        open_include(str(boundary / 'a'), 'missing.inc', str(boundary))
+
+@pytest.mark.integration
+def test_auto_compile_include_boundary(tmp_path):
+    """Rules compiled and saved with includes read from anywhere are not loaded by a scanner that
+    keeps includes inside the boundary, and a rule file that is refused is not read for the hash."""
+    signature_dir, outside = create_signature_dir(tmp_path)
+    create_file(outside, 'rule outside { condition: true }')
+    create_file(str(signature_dir / 'acme' / 'rule.yar'), 'include "../../outside.yar"\nrule own { condition: true }')
+    compiled_rules_dir = str(tmp_path / 'compiled')
+    os.makedirs(compiled_rules_dir)
+
+    scanner = YaraScanner(signature_dir=str(signature_dir), allow_includes_outside=True,
+                          auto_compile_rules=True, auto_compiled_rules_dir=compiled_rules_dir)
+    assert scanner.load_rules()
+    assert sorted(rule.identifier for rule in scanner.rules) == ['outside', 'own']
+    assert len(os.listdir(compiled_rules_dir)) == 1
+
+    scanner = YaraScanner(signature_dir=str(signature_dir),
+                          auto_compile_rules=True, auto_compiled_rules_dir=compiled_rules_dir)
+    assert scanner.load_rules()
+    assert [rule.identifier for rule in scanner.rules] == ['own']
+    assert len(os.listdir(compiled_rules_dir)) == 2
+
+    # a link out of the boundary changes nothing, whether or not its target exists
+    os.symlink(outside, str(signature_dir / 'acme' / 'link.yar'))
+    for _ in range(2):
+        scanner = YaraScanner(signature_dir=str(signature_dir),
+                              auto_compile_rules=True, auto_compiled_rules_dir=compiled_rules_dir)
+        assert scanner.load_rules()
+        assert [rule.identifier for rule in scanner.rules] == ['own']
+        assert len(os.listdir(compiled_rules_dir)) == 2
+        os.remove(outside) if os.path.exists(outside) else None

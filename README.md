@@ -38,6 +38,33 @@ for compiled in scanner.compiled_sources:
     print(compiled.path, compiled.namespace, compiled.error, compiled.rules)
 ```
 
+## Include Boundary
+
+**Behaviour change in 3.2.0.** An `include` statement can only read a regular file inside the *include boundary* of the rule file it is in, reached through no symbolic link. Before 3.2.0 an include could name any file the process could read: an absolute path, a path that climbed out of the rules directory with `..`, or a symbolic link to somewhere else.
+
+The boundary depends on how the rule file is tracked.
+
+```
+YaraScanner(signature_dir=...)   | the signature directory, for every directory found in it
+track_yara_dir(dir_path)         | dir_path
+track_yara_repository(dir_path)  | dir_path (not the root of the git repository)
+track_yara_file(file_path)       | the directory file_path is in
+```
+
+So a rule set of a signature directory can still include a file of the rule set next to it (`include "../common/shared.yar"`), and a file in a tracked directory can include files anywhere below that directory. To let includes reach further, give the track functions the directory to stay inside:
+
+```python
+scanner.track_yara_dir('/opt/rules/acme', include_boundary='/opt/rules')
+scanner.track_yara_repository('/opt/repo/rules', include_boundary='/opt/repo')
+scanner.track_yara_file('/opt/rules/acme/rule.yar', include_boundary='/opt/rules')
+```
+
+An include that is refused is handled like an include that cannot be read: it is compiled as empty, logged, and recorded in `compiled_sources` with an `error` that starts with `include refused:`. An absolute path and a path that leaves the boundary are refused from the path alone, without looking at the file, so the error is the same whether or not the file exists.
+
+A rule file found by listing a tracked directory can be a symbolic link, as long as what it resolves to is inside the boundary. One that resolves outside is left out of the rules and recorded with an `error` that starts with `rule file refused:`, like a rule file that cannot be read. This includes every rule file of a directory of the signature directory that is itself a link out of the signature directory; track such a directory with `track_yara_dir` instead. A file given to `track_yara_file` is read even when it is a link.
+
+To get the old behaviour back, create the scanner with `allow_includes_outside=True` (`--allow-includes-outside` on the command line). Only do that when everyone who can write a rule is trusted with every file the process can read. Rules saved by `auto_compile_rules` before 3.2.0, or with `allow_includes_outside=True`, are not loaded by a scanner that keeps the boundary; they are compiled again.
+
 ## Installation Instructions
 
 ### From Github
@@ -70,7 +97,7 @@ You can use the `-d` option to specified a different default location, or, you c
    ```
    usage: scan [-h] [-r] [--from-stdin] [-v] [-j] [-t] [--test-rule TEST_RULE] [--test-strings] [--test-strings-if] [--test-strings-threshold TEST_STRINGS_THRESHOLD] [--test-data TEST_DATA] [--csv CSV]
             [--performance-csv PERFORMANCE_CSV] [--failure-csv FAILURE_CSV] [--string-performance-csv STRING_PERFORMANCE_CSV] [--string-failure-csv STRING_FAILURE_CSV] [-y YARA_RULES] [-Y YARA_DIRS] [-G YARA_REPOS]
-            [-z COMPILED_YARA_RULES] [-c] [-C COMPILE_TO] [-b BLACKLISTED_RULES] [-B BLACKLISTED_RULES_PATH] [-a] [--auto-compiled-rules-dir AUTO_COMPILED_RULES_DIR] [-d SIGNATURE_DIR]
+            [-z COMPILED_YARA_RULES] [-c] [-C COMPILE_TO] [-b BLACKLISTED_RULES] [-B BLACKLISTED_RULES_PATH] [-a] [--auto-compiled-rules-dir AUTO_COMPILED_RULES_DIR] [-d SIGNATURE_DIR] [--allow-includes-outside]
             [PATHS [PATHS ...]]
 
 Scan the given file with yara using all available rulesets.
@@ -125,6 +152,8 @@ optional arguments:
                         DEPRECATED: Use a different signature directory than the default.
   --git-repo-dir GIT_REPO_DIRS
                         A subdirectory of --signature-dir that is part of a git repository. Only commits to the repository trigger a rule reload and matching rules report the commit. You can specify more than one of these.
+  --allow-includes-outside
+                        Let an include statement read any file, and a rule file be a link to any file. By default an include must be a regular file inside the directory its rules were loaded from (the signature directory for the directories in it), reached through no symbolic link.
    ```
 
 ## Command Line Examples
